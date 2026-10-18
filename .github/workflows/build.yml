@@ -81,8 +81,8 @@ jobs:
                   applicationId = "com.example.glucoble"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 4
-                  versionName = "1.3"
+                  versionCode = 5
+                  versionName = "1.4"
               }
           
               buildTypes {
@@ -235,6 +235,12 @@ jobs:
            * Главный экран приложения GlucoBLE Power Bridge.
            * Настроен специально на передачу глюкозы (ммоль/л) в поле «Мощность (Вт)» на велокомпьютер Geoid CC600.
            */
+          enum class BridgeMode { POWER, HEART_GLUCOSE, HEART_TEST;
+              companion object {
+                  fun restore(value: String?): BridgeMode = entries.firstOrNull { it.name == value } ?: POWER
+              }
+          }
+
           object BridgeProtocol {
               fun mmol(raw: Double, mgdl: Boolean): Double = if (mgdl) raw / 18.0182 else raw
               fun watts(mmol: Double, multiply: Boolean): Int =
@@ -244,8 +250,13 @@ jobs:
               // Flags: 3 bytes, complete 16-bit service UUID: 4, name header: 2.
               fun canIncludeName(name: String?, primary: Boolean = false): Boolean =
                   !name.isNullOrEmpty() && name.toByteArray(Charsets.UTF_8).size <= if (primary) 22 else 29
-              fun serviceUuid(heartTest: Boolean): Int = if (heartTest) 0x180d else 0x1818
-              fun heartTestMeasurement(): ByteArray = byteArrayOf(0, 93)
+              fun serviceUuid(heartProfile: Boolean): Int = if (heartProfile) 0x180d else 0x1818
+              fun heartMeasurement(value: Int): ByteArray {
+                  require(value in 0..65535)
+                  return if (value <= 255) byteArrayOf(0, value.toByte())
+                      else byteArrayOf(1, value.toByte(), (value ushr 8).toByte())
+              }
+              fun heartTestMeasurement(): ByteArray = heartMeasurement(93)
               fun accepts(value: Double, timestamp: Long, previous: Long, now: Long): Boolean =
                   value.isFinite() && value > 0 && timestamp > 0 && timestamp >= previous && timestamp <= now + 60000
           }
@@ -280,21 +291,21 @@ jobs:
           
               private lateinit var statusText: TextView
               private lateinit var checkMultiply10: CheckBox
-              private var lastDiagnostics = "GlucoPower 1.3: сначала запустите BLE-сервис"
+              private var lastDiagnostics = "GlucoPower 1.4: сначала запустите BLE-сервис"
           
               private val uiReceiver = object : BroadcastReceiver() {
                   override fun onReceive(context: Context?, intent: Intent?) {
                       if (intent?.action == GlucoBleBridgeService.ACTION_UI_UPDATE) {
                           val mmol = intent.getDoubleExtra("mmol", 0.0)
-                          val watts = intent.getIntExtra("watts", 0)
+                          val output = intent.getStringExtra("output") ?: "ожидание"
                           val source = intent.getStringExtra("source") ?: "ожидание"
                           val connected = intent.getIntExtra("connected", 0)
                           val ble = intent.getStringExtra("ble") ?: "ожидание"
                           lastDiagnostics = intent.getStringExtra("diagnostics") ?: lastDiagnostics
                           val updated = intent.getStringExtra("updated") ?: "ещё нет данных"
                           statusText.text = String.format(
-                              "Текущий сахар: %.1f ммоль/л\nГлюкоза × масштаб: %d Вт\nИсточник: %s\nПодписано BLE-клиентов: %d\nBLE: %s\nИзмерение: %s",
-                              mmol, watts, source, connected, ble, updated
+                              "Текущий сахар: %.1f ммоль/л\n%s\nИсточник: %s\nПодписано BLE-клиентов: %d\nBLE: %s\nИзмерение: %s",
+                              mmol, output, source, connected, ble, updated
                           )
                       }
                   }
@@ -310,7 +321,7 @@ jobs:
                   }
           
                   val titleView = TextView(this).apply {
-                      text = "GlucoPower 1.3 → Geoid CC600"
+                      text = "GlucoPower 1.4 → Geoid CC600"
                       textSize = 20f
                       setPadding(0, 0, 0, 24)
                   }
@@ -324,7 +335,7 @@ jobs:
                   root.addView(statusText)
           
                   checkMultiply10 = CheckBox(this).apply {
-                      text = "Умножать ммоль/л на 10 (9.3 ммоль/л → 93 Вт)"
+                      text = "Мощность: умножать ммоль/л на 10 (9.3 → 93 Вт)"
                       isChecked = true
                       setPadding(0, 16, 0, 24)
                   }
@@ -339,6 +350,15 @@ jobs:
                       }
                   }
                   root.addView(btnStart)
+                  root.addView(Button(this).apply {
+                      text = "Глюкоза через ЧСС: ммоль/л ×10"
+                      setOnClickListener {
+                          if (ensureBlePermissions()) startBridgeService(null, BridgeMode.HEART_GLUCOSE)
+                      }
+                  })
+                  root.addView(TextView(this).apply {
+                      text = "В режиме ЧСС 84 означает 8,4 ммоль/л. Это глюкоза, не пульс; на CC600 используется поле ЧСС."
+                  })
           
                   val btnTest = Button(this).apply {
                       text = "2. Тест: отправить 9.3 ммоль/л (93 Вт)"
@@ -353,7 +373,7 @@ jobs:
                   root.addView(Button(this).apply {
                       text = "Диагностика BLE: тестовый пульсометр 93"
                       setOnClickListener {
-                          if (ensureBlePermissions()) startBridgeService(null, true)
+                          if (ensureBlePermissions()) startBridgeService(null, BridgeMode.HEART_TEST)
                       }
                   })
           
@@ -429,9 +449,9 @@ jobs:
                   return true
               }
           
-              private fun startBridgeService(testMmol: Double?, heartTest: Boolean = false) {
+              private fun startBridgeService(testMmol: Double?, mode: BridgeMode = BridgeMode.POWER) {
                   val serviceIntent = Intent(this, GlucoBleBridgeService::class.java).apply {
-                      putExtra(GlucoBleBridgeService.EXTRA_HEART_TEST, heartTest)
+                      putExtra(GlucoBleBridgeService.EXTRA_MODE, mode.name)
                       putExtra(GlucoBleBridgeService.EXTRA_MULTIPLY_BY_10, checkMultiply10.isChecked)
                       if (testMmol != null) {
                           putExtra(GlucoBleBridgeService.EXTRA_TEST_MMOL, testMmol)
@@ -465,7 +485,7 @@ jobs:
                   private const val MGDL_TO_MMOL = 18.0182
           
                   const val EXTRA_MULTIPLY_BY_10 = "extra_multiply_by_10"
-                  const val EXTRA_HEART_TEST = "extra_heart_test"
+                  const val EXTRA_MODE = "extra_mode"
                   const val EXTRA_TEST_MMOL = "extra_test_mmol"
                   const val ACTION_UI_UPDATE = "com.example.glucoble.UI_UPDATE"
           
@@ -497,7 +517,15 @@ jobs:
               private var advertiser: BluetoothLeAdvertiser? = null
               private val subscribedDevices = CopyOnWriteArraySet<BluetoothDevice>()
               private var bleStatus = "не запущен"
-              private var heartTest = false
+              private var mode = BridgeMode.POWER
+              private val heartTest: Boolean get() = mode == BridgeMode.HEART_TEST
+              private val heartGlucose: Boolean get() = mode == BridgeMode.HEART_GLUCOSE
+              private val heartProfile: Boolean get() = mode != BridgeMode.POWER
+              private val modeLabel: String get() = when (mode) {
+                  BridgeMode.POWER -> "Мощность"
+                  BridgeMode.HEART_GLUCOSE -> "Глюкоза через ЧСС ×10 (не пульс)"
+                  BridgeMode.HEART_TEST -> "ТЕСТ пульсометра 93 (не реальные данные)"
+              }
               private val notificationQueue = BleNotificationQueue<BluetoothDevice>()
               private val bleEvents = java.util.ArrayDeque<String>()
               private val peerIds = linkedMapOf<BluetoothDevice, Int>()
@@ -510,8 +538,8 @@ jobs:
               private var destroyed = false
               private var bleGeneration = 0
               private var currentAdvertiseCallback: AdvertiseCallback? = null
-              private val activeService: UUID get() = bleUuid(BridgeProtocol.serviceUuid(heartTest))
-              private val activeMeasurement: UUID get() = if (heartTest) CHAR_HEART_MEASUREMENT else CHAR_POWER_MEASUREMENT
+              private val activeService: UUID get() = bleUuid(BridgeProtocol.serviceUuid(heartProfile))
+              private val activeMeasurement: UUID get() = if (heartProfile) CHAR_HEART_MEASUREMENT else CHAR_POWER_MEASUREMENT
               private val connectedDevices = CopyOnWriteArraySet<BluetoothDevice>()
               private val startupTimeout = Runnable {
                   if (isBleStarting) {
@@ -600,18 +628,27 @@ jobs:
               override fun onCreate() {
                   super.onCreate()
                   createNotificationChannel()
-                  currentMmol = savedReading.getString("mmol", null)?.toDoubleOrNull() ?: 0.0
-                  lastReadingTime = savedReading.getLong("timestamp", 0L)
-                  lastSource = savedReading.getString("source", null) ?: "ожидание xDrip+"
+                  restoreReading()
+                  mode = BridgeMode.restore(savedReading.getString("mode", null))
                   multiplyBy10 = savedReading.getBoolean("multiply", true)
                   registerGlucoseBroadcasts()
                   startLocalWebServerPoller()
               }
           
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  val nextHeartTest = intent?.getBooleanExtra(EXTRA_HEART_TEST, false) ?: false
-                  if (nextHeartTest != heartTest) stopBlePeripheral()
-                  heartTest = nextHeartTest
+                  val nextMode = if (intent == null) mode else BridgeMode.restore(intent.getStringExtra(EXTRA_MODE))
+                  if (nextMode != mode) {
+                      if ((nextMode == BridgeMode.POWER) != (mode == BridgeMode.POWER)) stopBlePeripheral()
+                      else {
+                          // Both HR modes share the same GATT service: retain the client's subscription.
+                          // Drop queued test values, but let any in-flight Android notification finish.
+                          subscribedDevices.forEach { notificationQueue.remove(it) }
+                      }
+                      recordBle("Смена режима: $mode -> $nextMode")
+                  }
+                  mode = nextMode
+                  savedReading.edit().putString("mode", mode.name).apply()
+                  if (intent?.hasExtra(EXTRA_TEST_MMOL) != true && lastSource.startsWith("ТЕСТ")) restoreReading()
                   multiplyBy10 = intent?.getBooleanExtra(EXTRA_MULTIPLY_BY_10, multiplyBy10) ?: multiplyBy10
                   savedReading.edit().putBoolean("multiply", multiplyBy10).apply()
                   if (intent?.hasExtra(EXTRA_TEST_MMOL) == true) {
@@ -666,22 +703,40 @@ jobs:
                   }
               }
           
+              private fun restoreReading() {
+                  lastSource = savedReading.getString("source", null) ?: "ожидание xDrip+"
+                  // Older versions could persist a manually generated test as the last reading.
+                  val realReading = !lastSource.startsWith("ТЕСТ")
+                  currentMmol = if (realReading) savedReading.getString("mmol", null)?.toDoubleOrNull() ?: 0.0 else 0.0
+                  lastReadingTime = if (realReading) savedReading.getLong("timestamp", 0L) else 0L
+                  if (!realReading) lastSource = "ожидание xDrip+"
+              }
+
               private fun updateGlucoseValue(rawValue: Double, source: String, mgdl: Boolean,
                                              timestamp: Long = System.currentTimeMillis()) {
                   val mmol = BridgeProtocol.mmol(rawValue, mgdl)
                   mainHandler.post {
                       if (destroyed) return@post
-                      if (!BridgeProtocol.accepts(mmol, timestamp, lastReadingTime, System.currentTimeMillis())) return@post
+                      val previous = if (lastSource.startsWith("ТЕСТ") && !source.startsWith("ТЕСТ")) 0L else lastReadingTime
+                      if (!BridgeProtocol.accepts(mmol, timestamp, previous, System.currentTimeMillis())) return@post
                       currentMmol = mmol
                       lastReadingTime = timestamp
                       lastSource = source
-                      savedReading.edit().putString("mmol", mmol.toString())
-                          .putLong("timestamp", timestamp).putString("source", source).apply()
+                      if (!source.startsWith("ТЕСТ")) {
+                          savedReading.edit().putString("mmol", mmol.toString())
+                              .putLong("timestamp", timestamp).putString("source", source).apply()
+                      }
                       refreshStatus()
                   }
               }
           
               private fun getWattsValue(): Int = BridgeProtocol.watts(currentMmol, multiplyBy10)
+              private fun outputText(): String = when {
+                  heartTest -> "ТЕСТ: 93 в поле ЧСС, не реальные данные"
+                  lastReadingTime == 0L -> "ожидание измерения"
+                  heartGlucose -> "${BridgeProtocol.watts(currentMmol, true)} в поле ЧСС — глюкоза ×10, не пульс"
+                  else -> "${getWattsValue()} Вт"
+              }
 
               private fun readingTime(): String = if (lastReadingTime == 0L) "ещё нет данных" else
                   SimpleDateFormat("dd.MM HH:mm:ss", Locale.getDefault()).format(Date(lastReadingTime))
@@ -697,10 +752,10 @@ jobs:
                   val uiIntent = Intent(ACTION_UI_UPDATE).apply {
                       setPackage(packageName)
                       putExtra("mmol", currentMmol)
-                      putExtra("watts", getWattsValue())
+                      putExtra("output", outputText())
                       putExtra("source", lastSource)
                       putExtra("connected", subscribedDevices.size)
-                      putExtra("ble", (if (heartTest) "ТЕСТ пульсометра 93 (не реальные данные). " else "Мощность. ") +
+                      putExtra("ble", "$modeLabel. " +
                           bleStatus + "; соединений: ${connectedDevices.size} (могут быть другие устройства)" +
                           "\nОтправка: $lastTransfer; Android принял: $submitted, завершил: $completed, ошибок: $sendErrors")
                       putExtra("diagnostics", diagnosticReport())
@@ -724,9 +779,9 @@ jobs:
               }
 
               private fun diagnosticReport(): String = buildString {
-                  appendLine("GlucoPower 1.3; ${Build.MANUFACTURER} ${Build.MODEL}; Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+                  appendLine("GlucoPower 1.4; ${Build.MANUFACTURER} ${Build.MODEL}; Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
                   appendLine("Прошивка телефона: ${Build.DISPLAY}")
-                  appendLine("Профиль: $activeService; характеристика: $activeMeasurement")
+                  appendLine("Режим: $modeLabel; профиль: $activeService; характеристика: $activeMeasurement")
                   appendLine("Соединения: ${connectedDevices.size}; подписки: ${subscribedDevices.size}")
                   appendLine("Android принял: $submitted; завершил успешно: $completed; ошибок: $sendErrors")
                   appendLine("$bleStatus; $lastTransfer")
@@ -791,7 +846,7 @@ jobs:
                   mainHandler.postDelayed(startupTimeout, 20000)
                   try {
                       gattServer = bluetoothManager?.openGattServer(this, createGattCallback(bleGeneration))
-                      val service = if (heartTest) createHeartTestService() else createCyclingPowerService()
+                      val service = if (heartProfile) createHeartService() else createCyclingPowerService()
                       if (gattServer?.addService(service) != true) {
                           stopBlePeripheral()
                           bleStatus = "Не удалось зарегистрировать GATT-сервис; повторите запуск"
@@ -822,7 +877,7 @@ jobs:
                       .setIncludeDeviceName(!primaryName && BridgeProtocol.canIncludeName(name))
                       .build()
                   recordBle("ADV: UUID=$activeService; имя в основном пакете=$primaryName")
-                  bleStatus = "GATT готов; запускается реклама ${if (heartTest) "0x180D" else "0x1818"}; имя: ${name ?: "нет"}"
+                  bleStatus = "GATT готов; запускается реклама ${if (heartProfile) "0x180D" else "0x1818"}; имя: ${name ?: "нет"}"
                   refreshStatus()
                   try {
                       val callback = createAdvertiseCallback(bleGeneration)
@@ -854,7 +909,7 @@ jobs:
                   advertiser = null
               }
 
-              private fun createHeartTestService(): BluetoothGattService {
+              private fun createHeartService(): BluetoothGattService {
                   val service = BluetoothGattService(SERVICE_HEART_RATE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
                   val measurement = BluetoothGattCharacteristic(CHAR_HEART_MEASUREMENT,
                       BluetoothGattCharacteristic.PROPERTY_NOTIFY, 0)
@@ -902,7 +957,11 @@ jobs:
           
               private fun broadcastPowerMeasurement() {
                   if (gattServer == null || subscribedDevices.isEmpty() || (!heartTest && lastReadingTime == 0L)) return
-                  val payload = if (heartTest) BridgeProtocol.heartTestMeasurement() else BridgeProtocol.measurement(getWattsValue())
+                  val payload = when (mode) {
+                      BridgeMode.POWER -> BridgeProtocol.measurement(getWattsValue())
+                      BridgeMode.HEART_GLUCOSE -> BridgeProtocol.heartMeasurement(BridgeProtocol.watts(currentMmol, true))
+                      BridgeMode.HEART_TEST -> BridgeProtocol.heartTestMeasurement()
+                  }
                   subscribedDevices.forEach { notificationQueue.offer(it, payload) }
                   sendNextNotification()
               }
@@ -957,7 +1016,7 @@ jobs:
                           isBleRunning = true
                           isBleStarting = false
                           recordBle("ADV: Android подтвердил запуск")
-                          bleStatus = "реклама ${if (heartTest) "0x180D (ТЕСТ 93)" else "0x1818 (мощность)"} запущена; ищите имя телефона / адрес"
+                          bleStatus = "реклама ${if (heartProfile) "0x180D (ЧСС)" else "0x1818 (мощность)"} запущена; ищите имя телефона / адрес"
                           refreshStatus()
                       }
                   }
@@ -1119,12 +1178,7 @@ jobs:
               }
           
               private fun buildNotification(): Notification {
-                  val text = String.format(
-                      "Сахар: %.1f ммоль/л → на Geoid CC600: %d Вт (%s)",
-                      currentMmol,
-                      getWattsValue(),
-                      lastSource
-                  )
+                  val text = String.format("Сахар: %.1f ммоль/л → %s (%s)", currentMmol, outputText(), lastSource)
                   val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                       Notification.Builder(this, CHANNEL_ID)
                   } else {
@@ -1139,7 +1193,7 @@ jobs:
                       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
                   return builder
                       .setContentTitle(if (heartTest) "GlucoPower: ТЕСТ пульсометра 93" else if (lastReadingTime == 0L) "GlucoPower: ожидание xDrip+" else
-                          String.format("%.1f ммоль/л → %d Вт", currentMmol, getWattsValue()))
+                          String.format("%.1f ммоль/л → %s", currentMmol, outputText()))
                       .setContentText(if (heartTest) "ТЕСТ BLE, не реальные данные" else updateText)
                       .setStyle(Notification.BigTextStyle().bigText(details))
                       .setWhen(lastReadingTime)
@@ -1210,6 +1264,17 @@ jobs:
                   assertEquals(0x180d, BridgeProtocol.serviceUuid(true))
                   assertArrayEquals(byteArrayOf(0, 93), BridgeProtocol.heartTestMeasurement())
               }
+              @Test fun heartGlucoseUsesUnsignedEightOrSixteenBitMeasurements() {
+                  assertArrayEquals(byteArrayOf(0, 84), BridgeProtocol.heartMeasurement(BridgeProtocol.watts(8.4, true)))
+                  assertArrayEquals(byteArrayOf(0, -1), BridgeProtocol.heartMeasurement(255))
+                  assertArrayEquals(byteArrayOf(1, 0, 1), BridgeProtocol.heartMeasurement(256))
+                  assertArrayEquals(byteArrayOf(1, 44, 1), BridgeProtocol.heartMeasurement(300))
+              }
+              @Test fun savedModeRestoresAndUnknownModeDefaultsToPower() {
+                  assertEquals(BridgeMode.HEART_GLUCOSE, BridgeMode.restore("HEART_GLUCOSE"))
+                  assertEquals(BridgeMode.POWER, BridgeMode.restore(null))
+                  assertEquals(BridgeMode.POWER, BridgeMode.restore("unknown"))
+              }
               @Test fun rejectsInvalidAndOutOfOrderMeasurements() {
                   assertFalse(BridgeProtocol.accepts(Double.NaN, 1000, 0, 1000))
                   assertFalse(BridgeProtocol.accepts(Double.POSITIVE_INFINITY, 1000, 0, 1000))
@@ -1272,10 +1337,10 @@ jobs:
                   device = mock(BluetoothDevice::class.java)
                   `when`(device.name).thenReturn("CC600 test client")
                   `when`(server.sendResponse(eq(device), anyInt(), anyInt(), anyInt(), nullable(ByteArray::class.java))).thenReturn(true)
-                  field("heartTest", true)
+                  field("mode", BridgeMode.HEART_TEST)
                   field("bleGeneration", 1)
                   field("gattServer", server)
-                  val service = invoke("createHeartTestService") as BluetoothGattService
+                  val service = invoke("createHeartService") as BluetoothGattService
                   `when`(server.getService(service.uuid)).thenReturn(service)
                   measurement = service.getCharacteristic(GlucoBleBridgeService.CHAR_HEART_MEASUREMENT)
                   cccd = measurement.getDescriptor(GlucoBleBridgeService.CCCD_UUID)
@@ -1315,7 +1380,7 @@ jobs:
               }
 
               @Test fun cyclingPowerSubscriptionSendsLatestGlucoseAsWatts() {
-                  field("heartTest", false)
+                  field("mode", BridgeMode.POWER)
                   field("currentMmol", 8.4)
                   field("lastReadingTime", 1000L)
                   val service = invoke("createCyclingPowerService") as BluetoothGattService
@@ -1336,6 +1401,60 @@ jobs:
                   subscribe()
                   assertTrue(report().contains("подписки: 0"))
                   verify(server, never()).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
+              }
+
+              @Test fun liveHeartProfileWaitsForGlucoseThenTransmitsXdripUpdatesTimesTen() {
+                  field("mode", BridgeMode.HEART_GLUCOSE)
+                  field("multiplyBy10", false) // Power setting must not change the HR glucose scale.
+                  subscribe()
+                  verify(server, never()).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
+                  val receiver = bridge.javaClass.getDeclaredField("glucoseReceiver")
+                      .apply { isAccessible = true }.get(bridge) as android.content.BroadcastReceiver
+                  fun reading(mmol: Double, time: Long) {
+                      receiver.onReceive(bridge, android.content.Intent("com.eveningoutpost.dexdrip.BgEstimate")
+                          .putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", mmol * 18.0182)
+                          .putExtra("com.eveningoutpost.dexdrip.Extras.Time", time))
+                      drain()
+                      invoke("broadcastPowerMeasurement")
+                  }
+                  val now = System.currentTimeMillis()
+                  reading(8.4, now - 1000)
+                  verify(server).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 84)))
+                  reading(9.3, now)
+                  callback.onNotificationSent(device, BluetoothGatt.GATT_SUCCESS)
+                  drain()
+                  verify(server).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 93)))
+                  assertTrue(report().contains("Глюкоза через ЧСС"))
+              }
+
+              @Test fun oldSavedTestReadingIsNotUsedAsLiveGlucose() {
+                  bridge.getSharedPreferences("bridge", android.content.Context.MODE_PRIVATE).edit()
+                      .putString("source", "ТЕСТ — не данные xDrip+").putString("mmol", "9.3")
+                      .putLong("timestamp", 1000L).commit()
+                  field("mode", BridgeMode.HEART_GLUCOSE)
+                  invoke("restoreReading")
+                  subscribe()
+                  verify(server, never()).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
+                  assertEquals("ожидание измерения", invoke("outputText"))
+              }
+
+              @Test fun switchingHeartTestToGlucoseKeepsSubscriptionAndReplacesQueuedTest() {
+                  field("isBleRunning", true)
+                  field("currentMmol", 8.4)
+                  field("lastReadingTime", System.currentTimeMillis())
+                  subscribe()
+                  invoke("broadcastPowerMeasurement") // Queued 93 must not survive the mode change.
+                  bridge.onStartCommand(android.content.Intent()
+                      .putExtra(GlucoBleBridgeService.EXTRA_MODE, BridgeMode.HEART_GLUCOSE.name), 0, 1)
+                  drain()
+                  verify(server, never()).close()
+                  assertTrue(report().contains("подписки: 1"))
+                  callback.onNotificationSent(device, BluetoothGatt.GATT_SUCCESS)
+                  drain()
+                  verify(server, times(1)).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 93)))
+                  verify(server, times(1)).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 84)))
+                  assertEquals("HEART_GLUCOSE", bridge.getSharedPreferences("bridge", android.content.Context.MODE_PRIVATE)
+                      .getString("mode", null))
               }
 
               @Test fun unsupportedIndicationSubscriptionDoesNotSendNotifications() {
