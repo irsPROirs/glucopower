@@ -81,8 +81,8 @@ jobs:
                   applicationId = "com.example.glucoble"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 2
-                  versionName = "1.1"
+                  versionCode = 3
+                  versionName = "1.2"
               }
           
               buildTypes {
@@ -236,8 +236,11 @@ jobs:
                   (mmol * if (multiply) 10.0 else 1.0).roundToInt().coerceIn(0, 32767)
               fun measurement(watts: Int): ByteArray = ByteBuffer.allocate(4)
                   .order(ByteOrder.LITTLE_ENDIAN).putShort(0).putShort(watts.toShort()).array()
-              fun canIncludeName(name: String?): Boolean =
-                  name != null && name.toByteArray(Charsets.UTF_8).size <= 29
+              // Flags: 3 bytes, complete 16-bit service UUID: 4, name header: 2.
+              fun canIncludeName(name: String?, primary: Boolean = false): Boolean =
+                  !name.isNullOrEmpty() && name.toByteArray(Charsets.UTF_8).size <= if (primary) 22 else 29
+              fun serviceUuid(heartTest: Boolean): Int = if (heartTest) 0x180d else 0x1818
+              fun heartTestMeasurement(): ByteArray = byteArrayOf(0, 93)
               fun accepts(value: Double, timestamp: Long, previous: Long, now: Long): Boolean =
                   value.isFinite() && value > 0 && timestamp > 0 && timestamp >= previous && timestamp <= now + 60000
           }
@@ -257,7 +260,7 @@ jobs:
                           val ble = intent.getStringExtra("ble") ?: "ожидание"
                           val updated = intent.getStringExtra("updated") ?: "ещё нет данных"
                           statusText.text = String.format(
-                              "Текущий сахар: %.1f ммоль/л\nПередаётся мощность: %d Вт\nИсточник: %s\nПодписано велокомпьютеров: %d\nBLE: %s\nИзмерение: %s",
+                              "Текущий сахар: %.1f ммоль/л\nГлюкоза × масштаб: %d Вт\nИсточник: %s\nПодписано велокомпьютеров: %d\nBLE: %s\nИзмерение: %s",
                               mmol, watts, source, connected, ble, updated
                           )
                       }
@@ -274,7 +277,7 @@ jobs:
                   }
           
                   val titleView = TextView(this).apply {
-                      text = "GlucoBLE → Geoid CC600 (Мощность)"
+                      text = "GlucoPower 1.2 → Geoid CC600"
                       textSize = 20f
                       setPadding(0, 0, 0, 24)
                   }
@@ -313,6 +316,13 @@ jobs:
                       }
                   }
                   root.addView(btnTest)
+
+                  root.addView(Button(this).apply {
+                      text = "Диагностика BLE: тестовый пульсометр 93"
+                      setOnClickListener {
+                          if (ensureBlePermissions()) startBridgeService(null, true)
+                      }
+                  })
           
                   val btnStop = Button(this).apply {
                       text = "Остановить трансляцию"
@@ -378,8 +388,9 @@ jobs:
                   return true
               }
           
-              private fun startBridgeService(testMmol: Double?) {
+              private fun startBridgeService(testMmol: Double?, heartTest: Boolean = false) {
                   val serviceIntent = Intent(this, GlucoBleBridgeService::class.java).apply {
+                      putExtra(GlucoBleBridgeService.EXTRA_HEART_TEST, heartTest)
                       putExtra(GlucoBleBridgeService.EXTRA_MULTIPLY_BY_10, checkMultiply10.isChecked)
                       if (testMmol != null) {
                           putExtra(GlucoBleBridgeService.EXTRA_TEST_MMOL, testMmol)
@@ -413,6 +424,7 @@ jobs:
                   private const val MGDL_TO_MMOL = 18.0182
           
                   const val EXTRA_MULTIPLY_BY_10 = "extra_multiply_by_10"
+                  const val EXTRA_HEART_TEST = "extra_heart_test"
                   const val EXTRA_TEST_MMOL = "extra_test_mmol"
                   const val ACTION_UI_UPDATE = "com.example.glucoble.UI_UPDATE"
           
@@ -435,6 +447,8 @@ jobs:
                   val CHAR_POWER_MEASUREMENT: UUID = bleUuid(0x2A63)
                   val CHAR_POWER_FEATURE: UUID = bleUuid(0x2A65)
                   val CHAR_SENSOR_LOCATION: UUID = bleUuid(0x2A5D)
+                  val SERVICE_HEART_RATE: UUID = bleUuid(0x180D)
+                  val CHAR_HEART_MEASUREMENT: UUID = bleUuid(0x2A37)
               }
           
               private var bluetoothManager: BluetoothManager? = null
@@ -442,6 +456,20 @@ jobs:
               private var advertiser: BluetoothLeAdvertiser? = null
               private val subscribedDevices = CopyOnWriteArraySet<BluetoothDevice>()
               private var bleStatus = "не запущен"
+              private var heartTest = false
+              private var bleGeneration = 0
+              private var currentAdvertiseCallback: AdvertiseCallback? = null
+              private val activeService: UUID get() = bleUuid(BridgeProtocol.serviceUuid(heartTest))
+              private val activeMeasurement: UUID get() = if (heartTest) CHAR_HEART_MEASUREMENT else CHAR_POWER_MEASUREMENT
+              private val connectedDevices = CopyOnWriteArraySet<BluetoothDevice>()
+              private val startupTimeout = Runnable {
+                  if (isBleStarting) {
+                      val stage = bleStatus
+                      stopBlePeripheral()
+                      bleStatus = "Нет ответа Bluetooth за 20 с ($stage). Выключите/включите Bluetooth и повторите запуск"
+                      refreshStatus()
+                  }
+              }
               private var wakeLock: PowerManager.WakeLock? = null
               private var lastNotificationRefresh = 0L
               private val savedReading by lazy { getSharedPreferences("bridge", Context.MODE_PRIVATE) }
@@ -524,6 +552,9 @@ jobs:
               }
           
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val nextHeartTest = intent?.getBooleanExtra(EXTRA_HEART_TEST, false) ?: false
+                  if (nextHeartTest != heartTest) stopBlePeripheral()
+                  heartTest = nextHeartTest
                   multiplyBy10 = intent?.getBooleanExtra(EXTRA_MULTIPLY_BY_10, multiplyBy10) ?: multiplyBy10
                   savedReading.edit().putBoolean("multiply", multiplyBy10).apply()
                   if (intent?.hasExtra(EXTRA_TEST_MMOL) == true) {
@@ -610,7 +641,8 @@ jobs:
                       putExtra("watts", getWattsValue())
                       putExtra("source", lastSource)
                       putExtra("connected", subscribedDevices.size)
-                      putExtra("ble", bleStatus)
+                      putExtra("ble", (if (heartTest) "ТЕСТ пульсометра 93 (не реальные данные). " else "Мощность. ") +
+                          bleStatus + "; соединений: ${connectedDevices.size}")
                       putExtra("updated", readingTime())
                   }
                   sendBroadcast(uiIntent)
@@ -662,17 +694,25 @@ jobs:
                       return
                   }
                   advertiser = adapter.bluetoothLeAdvertiser
-                  if (advertiser == null || !adapter.isMultipleAdvertisementSupported) {
+                  // Поддержка нескольких рекламодателей не нужна для одного экземпляра.
+                  if (advertiser == null) {
                       bleStatus = "Телефон не поддерживает BLE Peripheral / Advertising"
                       refreshStatus()
                       return
                   }
                   isBleStarting = true
                   bleStatus = "регистрация GATT-сервиса"
-                  gattServer = bluetoothManager?.openGattServer(this, gattServerCallback)
-                  if (gattServer?.addService(createCyclingPowerService()) != true) {
+                  mainHandler.postDelayed(startupTimeout, 20000)
+                  try {
+                      gattServer = bluetoothManager?.openGattServer(this, createGattCallback(bleGeneration))
+                      val service = if (heartTest) createHeartTestService() else createCyclingPowerService()
+                      if (gattServer?.addService(service) != true) {
+                          stopBlePeripheral()
+                          bleStatus = "Не удалось зарегистрировать GATT-сервис; повторите запуск"
+                      }
+                  } catch (e: RuntimeException) {
                       stopBlePeripheral()
-                      bleStatus = "Не удалось зарегистрировать GATT-сервис; повторите запуск"
+                      bleStatus = "Ошибка GATT: ${e.javaClass.simpleName}: ${e.message}"
                   }
                   refreshStatus()
               }
@@ -686,26 +726,50 @@ jobs:
                       .build()
                   // UUID должен быть в основном пакете: CC600 ищет датчики мощности 0x1818.
                   // Имя телефона может быть длиннее лимита legacy advertising (31 байт).
-                  val data = AdvertiseData.Builder()
-                      .setIncludeDeviceName(false)
-                      .addServiceUuid(ParcelUuid(SERVICE_CYCLING_POWER))
-                      .build()
-                  // Имя только в scan response, если оно помещается в отдельный пакет.
                   val name = bluetoothManager?.adapter?.name
-                  val scanResponse = AdvertiseData.Builder()
-                      .setIncludeDeviceName(BridgeProtocol.canIncludeName(name))
+                  val primaryName = BridgeProtocol.canIncludeName(name, primary = true)
+                  val data = AdvertiseData.Builder()
+                      .setIncludeDeviceName(primaryName)
+                      .addServiceUuid(ParcelUuid(activeService))
                       .build()
-                  advertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
+                  val scanResponse = AdvertiseData.Builder()
+                      .setIncludeDeviceName(!primaryName && BridgeProtocol.canIncludeName(name))
+                      .build()
+                  bleStatus = "GATT готов; запускается реклама ${if (heartTest) "0x180D" else "0x1818"}; имя: ${name ?: "нет"}"
+                  refreshStatus()
+                  try {
+                      val callback = createAdvertiseCallback(bleGeneration)
+                      currentAdvertiseCallback = callback
+                      advertiser?.startAdvertising(settings, data, scanResponse, callback)
+                  } catch (e: RuntimeException) {
+                      stopBlePeripheral()
+                      bleStatus = "Ошибка запуска рекламы: ${e.javaClass.simpleName}: ${e.message}"
+                      refreshStatus()
+                  }
               }
           
               private fun stopBlePeripheral() {
-                  runCatching { advertiser?.stopAdvertising(advertiseCallback) }
+                  bleGeneration++
+                  mainHandler.removeCallbacks(startupTimeout)
+                  runCatching { currentAdvertiseCallback?.let { advertiser?.stopAdvertising(it) } }
+                  currentAdvertiseCallback = null
                   runCatching { gattServer?.close() }
                   subscribedDevices.clear()
+                  connectedDevices.clear()
                   isBleRunning = false
                   isBleStarting = false
                   gattServer = null
                   advertiser = null
+              }
+
+              private fun createHeartTestService(): BluetoothGattService {
+                  val service = BluetoothGattService(SERVICE_HEART_RATE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
+                  val measurement = BluetoothGattCharacteristic(CHAR_HEART_MEASUREMENT,
+                      BluetoothGattCharacteristic.PROPERTY_NOTIFY, 0)
+                  measurement.addDescriptor(BluetoothGattDescriptor(CCCD_UUID,
+                      BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE))
+                  service.addCharacteristic(measurement)
+                  return service
               }
           
               private fun createCyclingPowerService(): BluetoothGattService {
@@ -746,7 +810,7 @@ jobs:
           
               private fun broadcastPowerMeasurement() {
                   val server = gattServer ?: return
-                  if (subscribedDevices.isEmpty() || lastReadingTime == 0L) return
+                  if (subscribedDevices.isEmpty() || (!heartTest && lastReadingTime == 0L)) return
           
                   val watts = getWattsValue()
           
@@ -754,31 +818,41 @@ jobs:
                   // Байты 0..1: Flags (uint16 = 0x0000, без дополнительных полей)
                   // Байты 2..3: Instantaneous Power в Ваттах (sint16, Little Endian)
                   val characteristic = server
-                      .getService(SERVICE_CYCLING_POWER)
-                      ?.getCharacteristic(CHAR_POWER_MEASUREMENT) ?: return
+                      .getService(activeService)
+                      ?.getCharacteristic(activeMeasurement) ?: return
           
-                  characteristic.value = BridgeProtocol.measurement(watts)
+                  val payload = if (heartTest) BridgeProtocol.heartTestMeasurement() else BridgeProtocol.measurement(watts)
                   for (device in subscribedDevices.toList()) {
                       runCatching {
-                          server.notifyCharacteristicChanged(device, characteristic, false)
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                              val result = server.notifyCharacteristicChanged(device, characteristic, false, payload)
+                              if (result != 0) Log.w(TAG, "Уведомление BLE не отправлено: $result")
+                              Unit
+                          } else {
+                              @Suppress("DEPRECATION")
+                              characteristic.value = payload
+                              @Suppress("DEPRECATION")
+                              server.notifyCharacteristicChanged(device, characteristic, false)
+                          }
                       }
                   }
               }
           
-              private val advertiseCallback = object : AdvertiseCallback() {
+              private fun createAdvertiseCallback(session: Int) = object : AdvertiseCallback() {
                   override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
                       mainHandler.post {
-                          if (!isBleStarting) return@post
+                          if (session != bleGeneration || !isBleStarting) return@post
+                          mainHandler.removeCallbacks(startupTimeout)
                           isBleRunning = true
                           isBleStarting = false
-                          bleStatus = "датчик мощности доступен для поиска (0x1818)"
+                          bleStatus = "реклама ${if (heartTest) "0x180D (ТЕСТ 93)" else "0x1818 (мощность)"} запущена; ищите имя телефона / адрес"
                           refreshStatus()
                       }
                   }
           
                   override fun onStartFailure(errorCode: Int) {
                       mainHandler.post {
-                          if (!isBleStarting) return@post
+                          if (session != bleGeneration || !isBleStarting) return@post
                           stopBlePeripheral()
                           bleStatus = when (errorCode) {
                               ADVERTISE_FAILED_DATA_TOO_LARGE -> "BLE: рекламный пакет слишком большой"
@@ -792,10 +866,10 @@ jobs:
                   }
               }
           
-              private val gattServerCallback = object : BluetoothGattServerCallback() {
+              private fun createGattCallback(session: Int) = object : BluetoothGattServerCallback() {
                   override fun onServiceAdded(status: Int, service: BluetoothGattService) {
                       mainHandler.post {
-                          if (!isBleStarting || gattServer == null || service.uuid != SERVICE_CYCLING_POWER) return@post
+                          if (session != bleGeneration || !isBleStarting || gattServer == null || service.uuid != activeService) return@post
                           if (status == BluetoothGatt.GATT_SUCCESS) {
                               advertisePowerService()
                           } else {
@@ -808,6 +882,7 @@ jobs:
 
                   override fun onDescriptorReadRequest(device: BluetoothDevice, requestId: Int,
                                                        offset: Int, descriptor: BluetoothGattDescriptor) {
+                      if (session != bleGeneration) return
                       val value = if (subscribedDevices.contains(device)) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                           else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
                       if (offset < 0 || offset > value.size) {
@@ -818,10 +893,14 @@ jobs:
                   }
 
                   override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+                      if (session != bleGeneration) return
                       if (newState == BluetoothProfile.STATE_CONNECTED) {
-                          Log.i(TAG, "Geoid CC600 подключился: ${device.address}")
+                          connectedDevices.add(device)
+                          Log.i(TAG, "BLE-клиент подключился: ${device.address}")
+                          notifyUi()
                       } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                           Log.i(TAG, "Geoid CC600 отключился: ${device.address}")
+                          connectedDevices.remove(device)
                           subscribedDevices.remove(device)
                           notifyUi()
                       }
@@ -833,6 +912,7 @@ jobs:
                       offset: Int,
                       characteristic: BluetoothGattCharacteristic
                   ) {
+                      if (session != bleGeneration) return
                       val responseBytes = when (characteristic.uuid) {
                           CHAR_POWER_FEATURE -> byteArrayOf(0x00, 0x00, 0x00, 0x00)
                           CHAR_SENSOR_LOCATION -> byteArrayOf(0x05) // Left Crank
@@ -855,6 +935,7 @@ jobs:
                       offset: Int,
                       value: ByteArray
                   ) {
+                      if (session != bleGeneration) return
                       if (preparedWrite || offset != 0 || descriptor.uuid != CCCD_UUID ||
                           (!value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) &&
                            !value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE))) {
@@ -905,13 +986,14 @@ jobs:
                   }
                   val stale = lastReadingTime > 0 && System.currentTimeMillis() - lastReadingTime > 15 * 60000L
                   val updateText = "Измерение: ${readingTime()}" + if (stale) " — нет свежих данных" else ""
-                  val details = "$text\n$updateText\nBLE: $bleStatus"
+                  val details = if (heartTest) "ТЕСТ BLE: 93 уд/мин, не реальный пульс или глюкоза.\nДля возврата нажмите «Запустить датчик мощности».\nBLE: $bleStatus"
+                      else "$text\n$updateText\nBLE: $bleStatus"
                   val openApp = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
                       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
                   return builder
-                      .setContentTitle(if (lastReadingTime == 0L) "GlucoPower: ожидание xDrip+" else
+                      .setContentTitle(if (heartTest) "GlucoPower: ТЕСТ пульсометра 93" else if (lastReadingTime == 0L) "GlucoPower: ожидание xDrip+" else
                           String.format("%.1f ммоль/л → %d Вт", currentMmol, getWattsValue()))
-                      .setContentText(updateText)
+                      .setContentText(if (heartTest) "ТЕСТ BLE, не реальные данные" else updateText)
                       .setStyle(Notification.BigTextStyle().bigText(details))
                       .setWhen(lastReadingTime)
                       .setShowWhen(lastReadingTime > 0)
@@ -968,6 +1050,18 @@ jobs:
                   assertFalse(BridgeProtocol.canIncludeName("x".repeat(30)))
                   assertFalse(BridgeProtocol.canIncludeName("Я".repeat(15)))
                   assertFalse(BridgeProtocol.canIncludeName(null))
+              }
+              @Test fun primaryAdvertisingNameLeavesRoomForFlagsAndPowerUuid() {
+                  assertTrue(BridgeProtocol.canIncludeName("vivo X300 Ultra", primary = true))
+                  assertTrue(BridgeProtocol.canIncludeName("x".repeat(22), primary = true))
+                  assertFalse(BridgeProtocol.canIncludeName("x".repeat(23), primary = true))
+                  assertFalse(BridgeProtocol.canIncludeName("Я".repeat(12), primary = true))
+                  assertFalse(BridgeProtocol.canIncludeName("", primary = true))
+              }
+              @Test fun heartDiagnosticDoesNotReplacePowerByDefault() {
+                  assertEquals(0x1818, BridgeProtocol.serviceUuid(false))
+                  assertEquals(0x180d, BridgeProtocol.serviceUuid(true))
+                  assertArrayEquals(byteArrayOf(0, 93), BridgeProtocol.heartTestMeasurement())
               }
               @Test fun rejectsInvalidAndOutOfOrderMeasurements() {
                   assertFalse(BridgeProtocol.accepts(Double.NaN, 1000, 0, 1000))
