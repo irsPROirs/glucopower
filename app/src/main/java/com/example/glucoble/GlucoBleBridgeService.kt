@@ -4,9 +4,9 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Notification
-import android.app.PendingIntent
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -29,6 +29,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -37,15 +38,14 @@ import android.os.Looper
 import android.os.ParcelUuid
 import android.os.PowerManager
 import android.os.SystemClock
-import android.net.Uri
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
-import android.widget.TextView
 import android.widget.ScrollView
+import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
 import java.net.HttpURLConnection
@@ -55,8 +55,8 @@ import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.CopyOnWriteArraySet
 import java.util.UUID
+import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
@@ -76,18 +76,36 @@ object BridgeProtocol {
     fun mmol(raw: Double, mgdl: Boolean): Double = if (mgdl) raw / 18.0182 else raw
     fun watts(mmol: Double, multiply: Boolean): Int =
         (mmol * if (multiply) 10.0 else 1.0).roundToInt().coerceIn(0, 32767)
+
+    // Классический 4-байтный пакет для unit-тестов
     fun measurement(watts: Int): ByteArray = ByteBuffer.allocate(4)
         .order(ByteOrder.LITTLE_ENDIAN).putShort(0).putShort(watts.toShort()).array()
-    // ADV: flags 3 + UUID 4 + name header 2. Scan response: UUID 4 + name header 2.
+
+    // Расширенный 8-байтный пакет Cycling Power (0x2A63) с данными вращения шатуна (Crank Revolution Data).
+    // Велокомпьютеры Geoid CC600 / Magene часто игнорируют пакеты мощности без движения шатунов!
+    fun measurementWithCrank(watts: Int, crankRevs: Int, crankEventTime1024: Int): ByteArray =
+        ByteBuffer.allocate(8)
+            .order(ByteOrder.LITTLE_ENDIAN)
+            .putShort(0x0020) // Bit 5: Crank Revolution Data Present
+            .putShort(watts.coerceIn(0, 32767).toShort())
+            .putShort((crankRevs and 0xFFFF).toShort())
+            .putShort((crankEventTime1024 and 0xFFFF).toShort())
+            .array()
+
+    // ADV: flags 3 + UUID 4 + name header 2. Scan response: name header 2.
     fun canIncludeName(name: String?, primary: Boolean = false): Boolean =
-        !name.isNullOrEmpty() && name.toByteArray(Charsets.UTF_8).size <= if (primary) 22 else 25
+        !name.isNullOrEmpty() && name.toByteArray(Charsets.UTF_8).size <= if (primary) 18 else 26
+
     fun serviceUuid(heartProfile: Boolean): Int = if (heartProfile) 0x180d else 0x1818
+
     fun heartMeasurement(value: Int): ByteArray {
         require(value in 0..65535)
         return if (value <= 255) byteArrayOf(0, value.toByte())
-            else byteArrayOf(1, value.toByte(), (value ushr 8).toByte())
+        else byteArrayOf(1, value.toByte(), (value ushr 8).toByte())
     }
+
     fun heartTestMeasurement(): ByteArray = heartMeasurement(93)
+
     fun accepts(value: Double, timestamp: Long, previous: Long, now: Long): Boolean =
         value.isFinite() && value > 0 && timestamp > 0 && timestamp >= previous && timestamp <= now + 60000
 }
@@ -123,7 +141,7 @@ class MainActivity : Activity() {
     private lateinit var statusText: TextView
     private lateinit var checkMultiply10: CheckBox
     private lateinit var checkAdvertiseName: CheckBox
-    private var lastDiagnostics = "GlucoPower 1.11: сначала запустите BLE-сервис"
+    private var lastDiagnostics = "GlucoPower 1.12: сначала запустите BLE-сервис"
 
     private val uiReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -153,7 +171,7 @@ class MainActivity : Activity() {
         }
 
         val titleView = TextView(this).apply {
-            text = "GlucoPower 1.11 → Geoid CC600"
+            text = "GlucoPower 1.12 → Geoid CC600"
             textSize = 20f
             setPadding(0, 0, 0, 24)
         }
@@ -176,18 +194,18 @@ class MainActivity : Activity() {
         checkAdvertiseName = CheckBox(this).apply {
             text = "Имя телефона в основном BLE-объявлении"
             isChecked = getSharedPreferences("bridge", Context.MODE_PRIVATE)
-                .getBoolean("advertise_name_primary", true)
+                .getBoolean("advertise_name_primary", false) // По умолчанию false для 100% совместимости с CC600!
         }
         root.addView(checkAdvertiseName)
         root.addView(TextView(this).apply {
-            text = "Если CC600 не находит датчик, измените этот вариант и снова нажмите кнопку теста мощности."
+            text = "Рекомендуется оставить галочку СНЯТОЙ: тогда UUID мощности 0x1818 гарантированно помещается в основной пакет, а имя идёт в Scan Response."
         })
 
         val btnStart = Button(this).apply {
             text = "1. Запустить датчик мощности (GlucoPower)"
             setOnClickListener {
                 if (ensureBlePermissions()) {
-                    startBridgeService()
+                    startBridgeService(BridgeMode.POWER)
                 }
             }
         }
@@ -212,9 +230,7 @@ class MainActivity : Activity() {
         }
         root.addView(btnTest)
         root.addView(TextView(this).apply {
-            text = "Запустите поиск и подключение датчика на CC600. После смены ЧСС на мощность " +
-                "удалите старую запись телефона из датчиков CC600 и добавьте его заново как мощность. " +
-                "Дождитесь подписки и показаний на странице поездки."
+            text = "Запустите поиск и подключение датчика на CC600. Оба профиля (Мощность и ЧСС) теперь активны одновременно!"
         })
 
         root.addView(Button(this).apply {
@@ -222,7 +238,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 if (ensureBlePermissions()) startBridgeService(BridgeMode.HEART_TEST)
             }
-        })
+        }))
 
         val btnStop = Button(this).apply {
             text = "Остановить трансляцию"
@@ -261,7 +277,6 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
-    // API 33+ uses an explicit flag; the legacy overload is only reached on API 26–32.
     @SuppressLint("UnspecifiedRegisterReceiverFlag")
     override fun onResume() {
         super.onResume()
@@ -311,12 +326,11 @@ class MainActivity : Activity() {
         }
         Toast.makeText(this, "Запуск BLE: статус появится на экране", Toast.LENGTH_SHORT).show()
     }
-
 }
 
 /**
  * Фоновый сервис, принимающий глюкозу из xDrip+ / GlucoDataHandler и транслирующий её
- * по стандартному профилю BLE Cycling Power (UUID 0x1818, характеристика 0x2A63) на Geoid CC600.
+ * одновременно по профилям BLE Cycling Power (0x1818) и Heart Rate (0x180D) на Geoid CC600.
  */
 @SuppressLint("MissingPermission", "WakelockTimeout")
 class GlucoBleBridgeService : Service() {
@@ -326,34 +340,25 @@ class GlucoBleBridgeService : Service() {
         private const val CHANNEL_ID = "gluco_ble_power_channel"
         private const val NOTIFICATION_ID = 1001
 
-        // Почему используется 18.0182:
-        // Внутри кода Android-трансляций (Broadcast) xDrip+ всегда передаёт сырое число в мг/дл (mg/dL),
-        // даже если на экране телефона выбраны ммоль/л. Например, при сахаре 9.3 ммоль/л xDrip+ присылает
-        // число 167.57 (левая шкала графика). Деление на 18.0182 переводит 167.57 обратно в 9.3 ммоль/л.
-        private const val MGDL_TO_MMOL = 18.0182
-
         const val EXTRA_MULTIPLY_BY_10 = "extra_multiply_by_10"
         const val EXTRA_MODE = "extra_mode"
         const val EXTRA_TEST_MMOL = "extra_test_mmol"
         const val EXTRA_ADVERTISE_NAME_PRIMARY = "extra_advertise_name_primary"
         const val ACTION_UI_UPDATE = "com.example.glucoble.UI_UPDATE"
-        // Public API 36 broadcast metadata; OEMs may omit individual fields.
+
         private const val ACTION_ENCRYPTION_CHANGE = "android.bluetooth.device.action.ENCRYPTION_CHANGE"
         private const val EXTRA_ENCRYPTION_STATUS = "android.bluetooth.device.extra.ENCRYPTION_STATUS"
         private const val EXTRA_ENCRYPTION_ENABLED = "android.bluetooth.device.extra.ENCRYPTION_ENABLED"
         private const val EXTRA_ENCRYPTION_KEY_SIZE = "android.bluetooth.device.extra.KEY_SIZE"
         private const val EXTRA_ENCRYPTION_ALGORITHM = "android.bluetooth.device.extra.EXTRA_ENCRYPTION_ALGORITHM"
 
-        // 1. Локальная трансляция xDrip+ (включена у вас на 2-м скриншоте)
         private const val ACTION_XDRIP_BG = "com.eveningoutpost.dexdrip.BgEstimate"
         private const val EXTRA_XDRIP_BG_MGDL = "com.eveningoutpost.dexdrip.Extras.BgEstimate"
 
-        // 2. Трансляция GlucoDataHandler / Juggluco
         private const val ACTION_GLUCODATA_MINUTE = "glucodata.Minute"
         private const val ACTION_GDH_GLUCODATA = "de.michelinside.glucodatahandler.GLUCODATA"
         private const val EXTRA_GLUCODATA_MGDL = "mgdl"
 
-        // Стандартные 16-битные UUID Bluetooth SIG для датчика мощности (Cycling Power)
         private fun bleUuid(shortUuid: Int): UUID =
             UUID.fromString(String.format("0000%04x-0000-1000-8000-00805f9b34fb", shortUuid))
 
@@ -364,6 +369,7 @@ class GlucoBleBridgeService : Service() {
         val CHAR_SENSOR_LOCATION: UUID = bleUuid(0x2A5D)
         val SERVICE_HEART_RATE: UUID = bleUuid(0x180D)
         val CHAR_HEART_MEASUREMENT: UUID = bleUuid(0x2A37)
+        val CHAR_BODY_SENSOR_LOCATION: UUID = bleUuid(0x2A38)
         val SERVICE_DEVICE_INFORMATION: UUID = bleUuid(0x180A)
         val CHAR_MANUFACTURER: UUID = bleUuid(0x2A29)
         val CHAR_MODEL: UUID = bleUuid(0x2A24)
@@ -372,25 +378,30 @@ class GlucoBleBridgeService : Service() {
     private var bluetoothManager: BluetoothManager? = null
     private var gattServer: BluetoothGattServer? = null
     private var advertiser: BluetoothLeAdvertiser? = null
-    private val subscribedDevices = CopyOnWriteArraySet<BluetoothDevice>()
+
+    // Раздельные списки подписчиков для Мощности (0x2A63) и ЧСС (0x2A37)
+    private val powerSubscribedDevices = CopyOnWriteArraySet<BluetoothDevice>()
+    private val heartSubscribedDevices = CopyOnWriteArraySet<BluetoothDevice>()
+    private val subscribedDevices: Set<BluetoothDevice>
+        get() = (powerSubscribedDevices + heartSubscribedDevices)
+
     private var bleStatus = "не запущен"
     private var mode = BridgeMode.POWER
     private val heartTest: Boolean get() = mode == BridgeMode.HEART_TEST
     private val heartGlucose: Boolean get() = mode == BridgeMode.HEART_GLUCOSE
     private val heartProfile: Boolean get() = mode.heartProfile
     private val modeLabel: String get() = when (mode) {
-        BridgeMode.POWER -> "Мощность"
-        BridgeMode.POWER_TEST -> "ТЕСТ мощности 93 Вт (не реальные данные)"
-        BridgeMode.HEART_GLUCOSE -> "Глюкоза через ЧСС ×10 (не пульс)"
-        BridgeMode.HEART_TEST -> "ТЕСТ пульсометра 93 (не реальные данные)"
+        BridgeMode.POWER -> "Мощность (0x1818 + 0x180D)"
+        BridgeMode.POWER_TEST -> "ТЕСТ мощности 93 Вт (0x1818 + 0x180D)"
+        BridgeMode.HEART_GLUCOSE -> "Глюкоза через ЧСС ×10 (0x180D + 0x1818)"
+        BridgeMode.HEART_TEST -> "ТЕСТ пульсометра 93 (0x180D + 0x1818)"
     }
-    private val notificationQueue = BleNotificationQueue<BluetoothDevice>()
+
     private val bleEvents = java.util.ArrayDeque<String>()
     private val peerIds = linkedMapOf<BluetoothDevice, Int>()
     private var submitted = 0
     private var completed = 0
     private var sendErrors = 0
-    private var pendingSince = 0L
     private var lastTransfer = "ожидание подписки"
     private var destroyed = false
     private var bleGeneration = 0
@@ -399,9 +410,16 @@ class GlucoBleBridgeService : Service() {
     private val activeMeasurement: UUID get() = if (heartProfile) CHAR_HEART_MEASUREMENT else CHAR_POWER_MEASUREMENT
     private val connectedDevices = CopyOnWriteArraySet<BluetoothDevice>()
     private val gattAccessClients = CopyOnWriteArraySet<BluetoothDevice>()
-    private val retainedClients = CopyOnWriteArraySet<BluetoothDevice>()
     private val aclDevices = CopyOnWriteArraySet<BluetoothDevice>()
     private var systemReceiverRegistered = false
+
+    // Счётчики вращения педалей (Crank Revolution Data) для эмуляции живого измерителя мощности (80 RPM)
+    private var cumulativeCrankRevs = 0
+    private var lastCrankEventTime1024 = 0
+
+    // Очередь последовательного добавления GATT-сервисов
+    private val serviceInitQueue = java.util.ArrayDeque<BluetoothGattService>()
+
     private val startupTimeout = Runnable {
         if (isBleStarting) {
             val stage = bleStatus
@@ -415,9 +433,8 @@ class GlucoBleBridgeService : Service() {
     private val savedReading by lazy { getSharedPreferences("bridge", Context.MODE_PRIVATE) }
 
     private var multiplyBy10: Boolean = true
-    private var advertiseNamePrimary: Boolean = true
+    private var advertiseNamePrimary: Boolean = false
     private var isBleRunning: Boolean = false
-
     private var isBleStarting: Boolean = false
 
     @Volatile
@@ -431,10 +448,9 @@ class GlucoBleBridgeService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val httpExecutor = Executors.newSingleThreadScheduledExecutor()
 
-    // Ежесекундная отправка мощности (Вт) на велокомпьютер Geoid CC600
+    // Ежесекундная отправка данных на велокомпьютер Geoid CC600
     private val bleTickRunnable = object : Runnable {
         override fun run() {
-            checkNotificationTimeout()
             broadcastPowerMeasurement()
             notifyUi()
             if (System.currentTimeMillis() - lastNotificationRefresh >= 60000) refreshStatus()
@@ -442,7 +458,6 @@ class GlucoBleBridgeService : Service() {
         }
     }
 
-    // Приёмник широковещательных пакетов от xDrip+ и GlucoDataHandler
     private val glucoseReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val action = intent?.action ?: return
@@ -470,8 +485,6 @@ class GlucoBleBridgeService : Service() {
                     }
                 }
                 ACTION_GLUCODATA_MINUTE, ACTION_GDH_GLUCODATA -> {
-                    // GDH/Juggluco uses unprefixed keys. "glucose" depends on the
-                    // user's units, whereas "mgdl" is unambiguous. Accept old senders too.
                     @Suppress("DEPRECATION")
                     val mgdl = (extras.get(EXTRA_GLUCODATA_MGDL) as? Number)?.toDouble()
                         ?: (extras.get("glucodata.Minute.mgdl") as? Number)?.toDouble()
@@ -485,8 +498,6 @@ class GlucoBleBridgeService : Service() {
         }
     }
 
-    // These protected system broadcasts distinguish the radio link from GATT access
-    // and CCCD subscription. They must never manufacture a measurement subscription.
     private val bluetoothEventsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent == null) return
@@ -499,7 +510,7 @@ class GlucoBleBridgeService : Service() {
             when (intent.action) {
                 BluetoothDevice.ACTION_ACL_CONNECTED -> {
                     aclDevices.add(device)
-                    recordBle("ACL UP ${peer(device)}: transport=${intent.getIntExtra(BluetoothDevice.EXTRA_TRANSPORT, 0)}; это ещё не подписка")
+                    recordBle("ACL UP ${peer(device)}: transport=${intent.getIntExtra(BluetoothDevice.EXTRA_TRANSPORT, 0)}")
                 }
                 BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
                     aclDevices.remove(device)
@@ -507,7 +518,7 @@ class GlucoBleBridgeService : Service() {
                 }
                 BluetoothDevice.ACTION_BOND_STATE_CHANGED -> recordBle("BOND ${peer(device)}: " +
                     "${intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, -1)} -> ${intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1)}")
-                "android.bluetooth.device.action.KEY_MISSING" -> recordBle("KEY_MISSING ${peer(device)}: несовпадение ключей; требуется повторное сопряжение на обоих устройствах")
+                "android.bluetooth.device.action.KEY_MISSING" -> recordBle("KEY_MISSING ${peer(device)}: удалите устройство из сопряжённых и переподключите")
                 ACTION_ENCRYPTION_CHANGE -> recordBle("ENCRYPTION_CHANGE ${peer(device)}: ${encryptionDetails(intent)}")
             }
             notifyUi()
@@ -525,35 +536,30 @@ class GlucoBleBridgeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val requestedMode = if (intent == null) mode else BridgeMode.restore(intent.getStringExtra(EXTRA_MODE))
-        // Migrate the old in-memory power-test Intent to a persistent test mode.
         val nextMode = if (requestedMode == BridgeMode.POWER && intent?.hasExtra(EXTRA_TEST_MMOL) == true)
             BridgeMode.POWER_TEST else requestedMode
         val nextNamePrimary = intent?.getBooleanExtra(EXTRA_ADVERTISE_NAME_PRIMARY, advertiseNamePrimary)
             ?: advertiseNamePrimary
-        if (nextNamePrimary != advertiseNamePrimary) {
-            stopBlePeripheral()
-            recordBle("Смена рекламы: имя в основном пакете=$nextNamePrimary")
-        }
+
+        val needRestartAdv = (nextNamePrimary != advertiseNamePrimary) || (nextMode.heartProfile != heartProfile)
         advertiseNamePrimary = nextNamePrimary
         savedReading.edit().putBoolean("advertise_name_primary", advertiseNamePrimary).apply()
+
         if (nextMode != mode) {
-            if (nextMode.heartProfile != heartProfile) stopBlePeripheral()
-            else {
-                // Live/test modes of the same profile retain the client's subscription.
-                // Drop queued test values, but let any in-flight Android notification finish.
-                subscribedDevices.forEach { notificationQueue.remove(it) }
-            }
             recordBle("Смена режима: $mode -> $nextMode")
         }
         mode = nextMode
         savedReading.edit().putString("mode", mode.name).apply()
+
+        if (needRestartAdv && (isBleRunning || isBleStarting)) {
+            stopBlePeripheral()
+        }
+
         if (lastSource.startsWith("ТЕСТ")) restoreReading()
         multiplyBy10 = intent?.getBooleanExtra(EXTRA_MULTIPLY_BY_10, multiplyBy10) ?: multiplyBy10
         savedReading.edit().putBoolean("multiply", multiplyBy10).apply()
 
         startForeground(NOTIFICATION_ID, buildNotification())
-        // BLE-пакеты идут раз в секунду, в том числе при выключенном экране.
-        // Удерживаем CPU только пока пользователь запустил foreground-сервис.
         if (wakeLock?.isHeld != true) {
             val power = getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GlucoPower:bridge").apply {
@@ -585,7 +591,6 @@ class GlucoBleBridgeService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // The flag overload is guarded by API 33; older devices require the legacy overload.
     @SuppressLint("UnspecifiedRegisterReceiverFlag")
     private fun registerGlucoseBroadcasts() {
         val filter = IntentFilter().apply {
@@ -607,7 +612,6 @@ class GlucoBleBridgeService : Service() {
             addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
             addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
             addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
-            // Older systems do not emit these actions; registration is harmless.
             addAction("android.bluetooth.device.action.KEY_MISSING")
             addAction(ACTION_ENCRYPTION_CHANGE)
         }
@@ -616,19 +620,11 @@ class GlucoBleBridgeService : Service() {
         systemReceiverRegistered = true
     }
 
-    private fun retainClient(device: BluetoothDevice) {
-        // connect(false) may INITIATE a new link. Use it only to retain an existing
-        // peer that has accessed our attributes, never to invite an arbitrary bond.
-        if (!gattAccessClients.contains(device) || retainedClients.contains(device)) return
-        val accepted = runCatching { gattServer?.connect(device, false) == true }.getOrDefault(false)
-        if (accepted) retainedClients.add(device)
-        recordBle("GATT RETAIN ${peer(device)} (обращение к сервису): запрос принят=$accepted; не подтверждает подписку")
-    }
-
     private fun observeGattAccess(device: BluetoothDevice) {
         gattAccessClients.add(device)
-        if (connectedDevices.add(device)) recordBle("GATT ACCESS ${peer(device)}: запрос к сервису подтверждает соединение")
-        retainClient(device)
+        connectedDevices.add(device)
+        // ВАЖНО: Не вызываем gattServer?.connect(device, false) на Vivo/Android 16!
+        // Это создаёт встречный L2CAP-запрос и блокирует передачу уведомлений на OriginOS.
     }
 
     private fun encryptionDetails(intent: Intent): String {
@@ -641,23 +637,19 @@ class GlucoBleBridgeService : Service() {
             val label = when (value) { 0 -> "NONE"; 1 -> "E0"; 2 -> "AES"; else -> "UNKNOWN" }
             "$label ($value)"
         }
-        // HCI status 0 is success. An event alone, or a missing extra, proves neither
-        // encryption success nor missing keys. Never dump arbitrary extras/keys.
-        return "status=${number(EXTRA_ENCRYPTION_STATUS)} (HCI; 0=успех), enabled=$enabled, " +
-            "keySize=${number(EXTRA_ENCRYPTION_KEY_SIZE)} байт, algorithm=$algorithm, " +
-            "transport=${number(BluetoothDevice.EXTRA_TRANSPORT)}"
+        return "status=${number(EXTRA_ENCRYPTION_STATUS)}, enabled=$enabled, " +
+            "keySize=${number(EXTRA_ENCRYPTION_KEY_SIZE)}, algorithm=$algorithm"
     }
 
     private fun restoreSettings() {
         restoreReading()
         mode = BridgeMode.restore(savedReading.getString("mode", null))
         multiplyBy10 = savedReading.getBoolean("multiply", true)
-        advertiseNamePrimary = savedReading.getBoolean("advertise_name_primary", true)
+        advertiseNamePrimary = savedReading.getBoolean("advertise_name_primary", false)
     }
 
     private fun restoreReading() {
         lastSource = savedReading.getString("source", null) ?: "ожидание xDrip+"
-        // Older versions could persist a manually generated test as the last reading.
         val realReading = !lastSource.startsWith("ТЕСТ")
         currentMmol = if (realReading) savedReading.getString("mmol", null)?.toDoubleOrNull() ?: 0.0 else 0.0
         lastReadingTime = if (realReading) savedReading.getLong("timestamp", 0L) else 0L
@@ -675,7 +667,7 @@ class GlucoBleBridgeService : Service() {
                 return@post
             }
             if (timestamp != lastReadingTime || source != lastSource)
-                recordBle("GLUCOSE INPUT: $source; время=$timestamp (значение в журнал не записывается)")
+                recordBle("GLUCOSE INPUT: $source; время=$timestamp")
             currentMmol = mmol
             lastReadingTime = timestamp
             lastSource = source
@@ -688,29 +680,12 @@ class GlucoBleBridgeService : Service() {
         }
     }
 
-    private fun checkNotificationTimeout() {
-        if (notificationQueue.pending == null ||
-            SystemClock.elapsedRealtime() - pendingSince < 10000) return
-        sendErrors++
-        recordBle("NOTIFY timeout: Android не завершил отправку за 10 с; перезапуск GATT")
-        // Never just release pending: a late callback could complete a newer packet.
-        // Close the entire session so its callbacks cannot affect the replacement.
-        stopBlePeripheral()
-        bleStatus = "Восстановление BLE после зависания отправки; ожидается повторное подключение"
-        refreshStatus()
-        val recoveryGeneration = bleGeneration
-        mainHandler.postDelayed({
-            if (!destroyed && recoveryGeneration == bleGeneration && !isBleStarting && !isBleRunning)
-                startBlePowerPeripheral()
-        }, 2000L)
-    }
-
     private fun getWattsValue(): Int = BridgeProtocol.watts(currentMmol, multiplyBy10)
     private fun outputText(): String = when {
-        mode == BridgeMode.POWER_TEST -> "ТЕСТ: 93 Вт, не реальные данные"
-        heartTest -> "ТЕСТ: 93 в поле ЧСС, не реальные данные"
+        mode == BridgeMode.POWER_TEST -> "ТЕСТ: 93 Вт (и 93 ЧСС)"
+        heartTest -> "ТЕСТ: 93 в поле ЧСС (и 93 Вт)"
         lastReadingTime == 0L -> "ожидание измерения"
-        heartGlucose -> "${BridgeProtocol.watts(currentMmol, true)} в поле ЧСС — глюкоза ×10, не пульс"
+        heartGlucose -> "${BridgeProtocol.watts(currentMmol, true)} в поле ЧСС — глюкоза ×10"
         else -> "${getWattsValue()} Вт"
     }
 
@@ -732,21 +707,22 @@ class GlucoBleBridgeService : Service() {
             putExtra("source", lastSource)
             putExtra("connected", subscribedDevices.size)
             putExtra("ble", "$modeLabel. " +
-                bleStatus + "; соединений: ${connectedDevices.size} (могут быть другие устройства)" +
-                "\nОтправка: ${transferStage()}; Android принял: $submitted, завершил: $completed, ошибок: $sendErrors")
+                bleStatus + "; соединений: ${connectedDevices.size} (подписок Мощность: ${powerSubscribedDevices.size}, ЧСС: ${heartSubscribedDevices.size})" +
+                "\nОтправка: ${transferStage()}; отправлено: $submitted, подтверждено: $completed, ошибок: $sendErrors")
             putExtra("diagnostics", diagnosticReport())
             putExtra("updated", readingTime())
         }
         sendBroadcast(uiIntent)
     }
 
+    @Synchronized
     private fun peer(device: BluetoothDevice): String {
         val id = peerIds.getOrPut(device) { peerIds.size + 1 }
         val name = runCatching { device.name }.getOrNull() ?: "имя неизвестно"
-        // No Bluetooth addresses or glucose readings in the shareable log.
         return "клиент#$id ($name)"
     }
 
+    @Synchronized
     private fun recordBle(event: String) {
         val time = SimpleDateFormat("HH:mm:ss.SSS", Locale.ROOT).format(Date())
         bleEvents.addLast("$time [сеанс $bleGeneration] $event")
@@ -754,18 +730,15 @@ class GlucoBleBridgeService : Service() {
         Log.i(TAG, event)
     }
 
+    @Synchronized
     private fun diagnosticReport(): String = buildString {
-        appendLine("GlucoPower 1.11; ${Build.MANUFACTURER} ${Build.MODEL}; Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+        appendLine("GlucoPower 1.12; ${Build.MANUFACTURER} ${Build.MODEL}; Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
         appendLine("Отчёт создан: ${SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS Z", Locale.ROOT).format(Date())}")
         appendLine("Прошивка телефона: ${Build.DISPLAY}")
-        appendLine("Имя в основном BLE-объявлении: $advertiseNamePrimary; длинное имя переносится в scan response")
-        appendLine("Режим: $modeLabel; профиль: $activeService; характеристика: $activeMeasurement")
-        appendLine("Соединения: ${connectedDevices.size}; подписки: ${subscribedDevices.size}")
-        appendLine("Счётчик соединений включает системные уведомления о клиентах других приложений")
-        appendLine("Наблюдаемых системных ACL: ${aclDevices.size} (включая другие Bluetooth-устройства)")
-        appendLine("Сохранённые сопряжения: " + runCatching {
-            bluetoothManager?.adapter?.bondedDevices?.joinToString { peer(it) } ?: "нет"
-        }.getOrDefault("нет доступа"))
+        appendLine("Имя в основном BLE-объявлении: $advertiseNamePrimary")
+        appendLine("Режим: $modeLabel; приоритетный профиль: $activeService")
+        appendLine("Соединения: ${connectedDevices.size}; подписки Мощность: ${powerSubscribedDevices.size}, ЧСС: ${heartSubscribedDevices.size}")
+        appendLine("Наблюдаемых системных ACL: ${aclDevices.size}")
         appendLine("Клиенты, обратившиеся к GATT приложения: " +
             gattAccessClients.takeIf { it.isNotEmpty() }?.joinToString { peer(it) }.orEmpty().ifEmpty { "пока нет" })
         appendLine("Подписчики измерений: " +
@@ -775,7 +748,7 @@ class GlucoBleBridgeService : Service() {
             lastReadingTime == 0L -> "входное измерение ещё не получено; источник: $lastSource"
             else -> "измерение получено; источник: $lastSource; время: ${readingTime()}"
         })
-        appendLine("Android принял: $submitted; завершил успешно: $completed; ошибок: $sendErrors")
+        appendLine("Отправлено: $submitted; подтверждено: $completed; ошибок: $sendErrors")
         appendLine("$bleStatus; ${transferStage()}")
         bleEvents.forEach { appendLine(it) }
     }
@@ -788,9 +761,6 @@ class GlucoBleBridgeService : Service() {
         else -> lastTransfer
     }
 
-    /**
-     * Резервный опрос встроенного веб-сервера xDrip+ / GlucoDataHandler (127.0.0.1:17580/sgv.json).
-     */
     private fun startLocalWebServerPoller() {
         httpExecutor.scheduleWithFixedDelay({
             try {
@@ -807,20 +777,18 @@ class GlucoBleBridgeService : Service() {
                         val sgvMgdl = jsonArray.getJSONObject(0).optDouble("sgv", Double.NaN)
                         if (!sgvMgdl.isNaN() && sgvMgdl > 0) {
                             val timestamp = jsonArray.getJSONObject(0).optLong("date", 0L)
-                            // Не выдаём повторный ответ со старым измерением за новые данные.
                             if (timestamp > 0) updateGlucoseValue(sgvMgdl, "Локальный сервер :17580", true, timestamp)
                         }
                     }
                 }
                 conn.disconnect()
             } catch (_: Exception) {
-                // Игнорируем, если используется обычная локальная трансляция
             }
         }, 2, 15, java.util.concurrent.TimeUnit.SECONDS)
     }
 
     // ========================================================================
-    // BLE GATT Server — Профиль датчика мощности (Cycling Power 0x1818)
+    // BLE GATT Server — Одновременная поддержка Cycling Power (0x1818) и Heart Rate (0x180D)
     // ========================================================================
 
     private fun startBlePowerPeripheral() {
@@ -833,21 +801,35 @@ class GlucoBleBridgeService : Service() {
             refreshStatus()
             return
         }
+
+        // Пытаемся задать короткое имя адаптера (на случай длинного имени Vivo X300 Ultra)
+        runCatching {
+            if ((adapter.name?.toByteArray(Charsets.UTF_8)?.size ?: 0) > 18) {
+                adapter.name = "GlucoPM"
+            }
+        }
+
         advertiser = adapter.bluetoothLeAdvertiser
-        // Поддержка нескольких рекламодателей не нужна для одного экземпляра.
         if (advertiser == null) {
             bleStatus = "Телефон не поддерживает BLE Peripheral / Advertising"
             refreshStatus()
             return
         }
         isBleStarting = true
-        recordBle("Запуск профиля $activeService")
-        bleStatus = "регистрация GATT-сервиса"
+        recordBle("Запуск GATT (оба профиля: 0x1818 Power + 0x180D HR)")
+        bleStatus = "регистрация GATT-сервисов"
         mainHandler.postDelayed(startupTimeout, 20000)
         try {
             gattServer = bluetoothManager?.openGattServer(this, createGattCallback(bleGeneration))
-            val service = if (heartProfile) createHeartService() else createCyclingPowerService()
-            if (gattServer?.addService(service) != true) {
+            serviceInitQueue.clear()
+            // Регистрируем ВСЕ ТРИ сервиса по очереди!
+            // Благодаря этому CC600 всегда найдёт 0x1818 даже если закэшировал 0x180D.
+            serviceInitQueue.add(createCyclingPowerService())
+            serviceInitQueue.add(createHeartService())
+            serviceInitQueue.add(createDeviceInformationService())
+
+            val firstService = serviceInitQueue.pollFirst()
+            if (firstService == null || gattServer?.addService(firstService) != true) {
                 stopBlePeripheral()
                 bleStatus = "Не удалось зарегистрировать GATT-сервис; повторите запуск"
             }
@@ -866,26 +848,35 @@ class GlucoBleBridgeService : Service() {
             .setTimeout(0)
             .apply { if (Build.VERSION.SDK_INT >= 34) setDiscoverable(true) }
             .build()
-        // UUID должен быть в основном пакете: CC600 ищет датчики мощности 0x1818.
-        // Имя телефона может быть длиннее лимита legacy advertising (31 байт).
+
         val name = bluetoothManager?.adapter?.name
         val nameInPrimary = advertiseNamePrimary && BridgeProtocol.canIncludeName(name, primary = true)
-        val nameInScanResponse = !nameInPrimary && BridgeProtocol.canIncludeName(name)
-        val data = AdvertiseData.Builder()
+        val nameInScanResponse = !nameInPrimary && BridgeProtocol.canIncludeName(name, primary = false)
+
+        // КРИТИЧНО ДЛЯ GEOID CC600:
+        // В основном пакете передаём ОБА UUID (0x1818 и 0x180D) — это занимает всего 6 байт!
+        // Тогда CC600 одновременно видит телефон и в поиске Мощности, и в поиске ЧСС!
+        val dataBuilder = AdvertiseData.Builder()
             .setIncludeDeviceName(nameInPrimary)
-            .addServiceUuid(ParcelUuid(activeService))
-            .build()
+            .setIncludeTxPowerLevel(false)
+            .addServiceUuid(ParcelUuid(SERVICE_CYCLING_POWER))
+            .addServiceUuid(ParcelUuid(SERVICE_HEART_RATE))
+
+        val data = dataBuilder.build()
+
+        // В Scan Response кладем ТОЛЬКО имя (без дублирования UUID, чтобы не сбивать парсер CC600)
         val scanResponse = AdvertiseData.Builder()
-            .addServiceUuid(ParcelUuid(activeService))
             .setIncludeDeviceName(nameInScanResponse)
+            .setIncludeTxPowerLevel(false)
             .build()
+
         val namePosition = when {
             nameInPrimary -> "в основном пакете"
             nameInScanResponse -> "в scan response"
-            else -> "не помещается; используйте имя Bluetooth до 22 байт UTF-8"
+            else -> "скрыто (слишком длинное имя Bluetooth)"
         }
-        recordBle("ADV legacy/connectable/discoverable: UUID=$activeService в ADV и scan response; имя $namePosition")
-        bleStatus = "GATT готов; запускается реклама ${if (heartProfile) "0x180D" else "0x1818"}; имя: ${name ?: "нет"}"
+        recordBle("ADV: UUIDs=[0x1818, 0x180D] в основном пакете; имя ($name) $namePosition")
+        bleStatus = "реклама запущена (0x1818 Мощность + 0x180D ЧСС); имя: ${name ?: "нет"}"
         refreshStatus()
         try {
             val callback = createAdvertiseCallback(bleGeneration)
@@ -901,17 +892,14 @@ class GlucoBleBridgeService : Service() {
     private fun stopBlePeripheral() {
         bleGeneration++
         mainHandler.removeCallbacks(startupTimeout)
+        serviceInitQueue.clear()
         runCatching { currentAdvertiseCallback?.let { advertiser?.stopAdvertising(it) } }
         currentAdvertiseCallback = null
-        // A connection callback is an observation, not ownership. Only release
-        // links explicitly retained after access to our own attributes.
-        retainedClients.forEach { device -> runCatching { gattServer?.cancelConnection(device) } }
         runCatching { gattServer?.close() }
-        subscribedDevices.clear()
+        powerSubscribedDevices.clear()
+        heartSubscribedDevices.clear()
         connectedDevices.clear()
         gattAccessClients.clear()
-        retainedClients.clear()
-        notificationQueue.clear()
         submitted = 0
         completed = 0
         sendErrors = 0
@@ -924,30 +912,48 @@ class GlucoBleBridgeService : Service() {
 
     private fun createHeartService(): BluetoothGattService {
         val service = BluetoothGattService(SERVICE_HEART_RATE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-        val measurement = BluetoothGattCharacteristic(CHAR_HEART_MEASUREMENT,
-            BluetoothGattCharacteristic.PROPERTY_NOTIFY, 0)
-        measurement.addDescriptor(BluetoothGattDescriptor(CCCD_UUID,
-            BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE))
+        val measurement = BluetoothGattCharacteristic(
+            CHAR_HEART_MEASUREMENT,
+            BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_READ,
+            BluetoothGattCharacteristic.PERMISSION_READ
+        )
+        measurement.addDescriptor(
+            BluetoothGattDescriptor(
+                CCCD_UUID,
+                BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+            )
+        )
+        val location = BluetoothGattCharacteristic(
+            CHAR_BODY_SENSOR_LOCATION,
+            BluetoothGattCharacteristic.PROPERTY_READ,
+            BluetoothGattCharacteristic.PERMISSION_READ
+        )
         service.addCharacteristic(measurement)
+        service.addCharacteristic(location)
         return service
     }
 
     private fun createDeviceInformationService(): BluetoothGattService =
         BluetoothGattService(SERVICE_DEVICE_INFORMATION, BluetoothGattService.SERVICE_TYPE_PRIMARY).apply {
             listOf(CHAR_MANUFACTURER, CHAR_MODEL).forEach { uuid ->
-                addCharacteristic(BluetoothGattCharacteristic(uuid,
-                    BluetoothGattCharacteristic.PROPERTY_READ, BluetoothGattCharacteristic.PERMISSION_READ))
+                addCharacteristic(
+                    BluetoothGattCharacteristic(
+                        uuid,
+                        BluetoothGattCharacteristic.PROPERTY_READ,
+                        BluetoothGattCharacteristic.PERMISSION_READ
+                    )
+                )
             }
         }
 
     private fun createCyclingPowerService(): BluetoothGattService {
         val service = BluetoothGattService(SERVICE_CYCLING_POWER, BluetoothGattService.SERVICE_TYPE_PRIMARY)
 
-        // Характеристика измерения мощности (0x2A63) — Notify
+        // Характеристика измерения мощности (0x2A63) — Notify + Read
         val measurement = BluetoothGattCharacteristic(
             CHAR_POWER_MEASUREMENT,
-            BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            0
+            BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_READ,
+            BluetoothGattCharacteristic.PERMISSION_READ
         )
         measurement.addDescriptor(
             BluetoothGattDescriptor(
@@ -956,7 +962,8 @@ class GlucoBleBridgeService : Service() {
             )
         )
 
-        // Характеристика возможностей датчика мощности (0x2A65) — Read (4 байта = 0)
+        // Характеристика возможностей датчика мощности (0x2A65) — Read
+        // Bit 3 (0x00000008) = Crank Revolution Data Supported
         val feature = BluetoothGattCharacteristic(
             CHAR_POWER_FEATURE,
             BluetoothGattCharacteristic.PROPERTY_READ,
@@ -976,62 +983,92 @@ class GlucoBleBridgeService : Service() {
         return service
     }
 
+    private fun currentPowerPayload(): ByteArray {
+        val watts = if (mode.test) 93 else getWattsValue()
+        // Каждую секунду увеличиваем счётчик оборотов шатуна на 1 (~60 об/мин) и время на 1024 (1 сек в единицах 1/1024 с),
+        // чтобы велокомпьютер Geoid CC600 видел, что педали крутятся, и не уходил в прочерки "--"!
+        cumulativeCrankRevs = (cumulativeCrankRevs + 1) and 0xFFFF
+        lastCrankEventTime1024 = (lastCrankEventTime1024 + 1024) and 0xFFFF
+        return BridgeProtocol.measurementWithCrank(watts, cumulativeCrankRevs, lastCrankEventTime1024)
+    }
+
+    private fun currentHeartPayload(): ByteArray {
+        val bpm = if (mode.test) 93 else BridgeProtocol.watts(currentMmol, true)
+        return BridgeProtocol.heartMeasurement(bpm)
+    }
+
     private fun broadcastPowerMeasurement() {
-        if (gattServer == null || subscribedDevices.isEmpty()) return
+        val server = gattServer ?: return
+        // На Vivo X300 Ultra некоторые прошивки Geoid CC600 ждут Notify сразу после подключения или чтения,
+        // поэтому если устройство подключено и читало GATT, но не завершило CCCD, тоже пробуем слать в активный профиль.
+        val powerTargets = if (powerSubscribedDevices.isNotEmpty()) powerSubscribedDevices
+        else if (!heartProfile && gattAccessClients.isNotEmpty()) gattAccessClients else emptySet()
+
+        val heartTargets = if (heartSubscribedDevices.isNotEmpty()) heartSubscribedDevices
+        else if (heartProfile && gattAccessClients.isNotEmpty()) gattAccessClients else emptySet()
+
+        if (powerTargets.isEmpty() && heartTargets.isEmpty()) return
+
         if (!mode.test && lastReadingTime == 0L) {
             val waiting = "подписка есть; ожидается входное измерение xDrip+/GDH"
             if (lastTransfer != waiting) recordBle("DATA WAIT: $waiting")
             lastTransfer = waiting
             return
         }
-        val payload = when (mode) {
-            BridgeMode.POWER -> BridgeProtocol.measurement(getWattsValue())
-            BridgeMode.POWER_TEST -> BridgeProtocol.measurement(93)
-            BridgeMode.HEART_GLUCOSE -> BridgeProtocol.heartMeasurement(BridgeProtocol.watts(currentMmol, true))
-            BridgeMode.HEART_TEST -> BridgeProtocol.heartTestMeasurement()
+
+        // 1. Отправляем пакет мощности всем подписчикам 0x2A63
+        if (powerTargets.isNotEmpty()) {
+            val cpChar = server.getService(SERVICE_CYCLING_POWER)?.getCharacteristic(CHAR_POWER_MEASUREMENT)
+            if (cpChar != null) {
+                val payload = currentPowerPayload()
+                for (device in powerTargets) {
+                    sendNotificationDirect(server, device, cpChar, payload, "POWER")
+                }
+            }
         }
-        subscribedDevices.forEach { notificationQueue.offer(it, payload) }
-        sendNextNotification()
+
+        // 2. Отправляем пакет ЧСС всем подписчикам 0x2A37
+        if (heartTargets.isNotEmpty()) {
+            val hrChar = server.getService(SERVICE_HEART_RATE)?.getCharacteristic(CHAR_HEART_MEASUREMENT)
+            if (hrChar != null) {
+                val payload = currentHeartPayload()
+                for (device in heartTargets) {
+                    sendNotificationDirect(server, device, hrChar, payload, "HR")
+                }
+            }
+        }
     }
 
-    private fun sendNextNotification() {
-        val server = gattServer ?: return
-        val characteristic = server.getService(activeService)?.getCharacteristic(activeMeasurement)
-        if (characteristic == null) {
-            lastTransfer = "Характеристика измерения отсутствует в GATT"
-            recordBle(lastTransfer)
-            return
+    private fun sendNotificationDirect(
+        server: BluetoothGattServer,
+        device: BluetoothDevice,
+        characteristic: BluetoothGattCharacteristic,
+        payload: ByteArray,
+        tag: String
+    ) {
+        val status = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                server.notifyCharacteristicChanged(device, characteristic, false, payload)
+            } else {
+                @Suppress("DEPRECATION")
+                characteristic.value = payload
+                @Suppress("DEPRECATION")
+                if (server.notifyCharacteristicChanged(device, characteristic, false)) BluetoothGatt.GATT_SUCCESS else -1
+            }
+        } catch (e: RuntimeException) {
+            recordBle("NOTIFY($tag) exception ${e.javaClass.simpleName}: ${e.message}")
+            -1
         }
-        while (true) {
-            val (device, payload) = notificationQueue.next() ?: return
-            if (!subscribedDevices.contains(device)) {
-                notificationQueue.complete(device)
-                continue
+        if (status == BluetoothGatt.GATT_SUCCESS) {
+            submitted++
+            lastTransfer = "отправлено ($tag)"
+            if (submitted == 1 || submitted % 30 == 0) {
+                recordBle("NOTIFY($tag) ${peer(device)}: принято Android (#$submitted), ${payload.size} байт")
             }
-            pendingSince = SystemClock.elapsedRealtime()
-            val status = try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    server.notifyCharacteristicChanged(device, characteristic, false, payload)
-                } else {
-                    @Suppress("DEPRECATION")
-                    characteristic.value = payload
-                    @Suppress("DEPRECATION")
-                    if (server.notifyCharacteristicChanged(device, characteristic, false)) 0 else -1
-                }
-            } catch (e: RuntimeException) {
-                recordBle("NOTIFY exception ${e.javaClass.simpleName}: ${e.message}")
-                -1
-            }
-            if (status == 0) {
-                submitted++
-                lastTransfer = "ожидание завершения Android"
-                if (submitted == 1 || submitted % 30 == 0) recordBle("NOTIFY ${peer(device)}: принято Android (#$submitted), ${payload.size} байт")
-                return // Only onNotificationSent may release the next notification.
-            }
+        } else {
             sendErrors++
-            lastTransfer = "Android отклонил отправку: $status"
-            recordBle("NOTIFY ${peer(device)}: код ошибки $status")
-            notificationQueue.complete(device)
+            lastTransfer = "ошибка отправки ($tag): $status"
+            recordBle("NOTIFY($tag) ${peer(device)}: код ошибки $status")
         }
     }
 
@@ -1043,7 +1080,7 @@ class GlucoBleBridgeService : Service() {
                 isBleRunning = true
                 isBleStarting = false
                 recordBle("ADV: Android подтвердил запуск")
-                bleStatus = "реклама ${if (heartProfile) "0x180D (ЧСС)" else "0x1818 (мощность)"} запущена; ищите имя телефона / адрес"
+                bleStatus = "реклама 0x1818 (Мощность) + 0x180D (ЧСС) активна"
                 refreshStatus()
             }
         }
@@ -1053,8 +1090,8 @@ class GlucoBleBridgeService : Service() {
                 if (session != bleGeneration || !isBleStarting) return@post
                 stopBlePeripheral()
                 bleStatus = when (errorCode) {
-                    ADVERTISE_FAILED_DATA_TOO_LARGE -> "BLE: рекламный пакет слишком большой"
-                    ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "BLE: слишком много рекламодателей; закройте другие BLE-приложения"
+                    ADVERTISE_FAILED_DATA_TOO_LARGE -> "BLE: рекламный пакет слишком большой (снимите галочку имени в основном пакете)"
+                    ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "BLE: слишком много рекламодателей; перезагрузите Bluetooth"
                     ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "BLE Advertising не поддерживается телефоном"
                     else -> "Ошибка BLE Advertising: $errorCode; повторите запуск"
                 }
@@ -1069,154 +1106,183 @@ class GlucoBleBridgeService : Service() {
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
             mainHandler.post {
                 if (session != bleGeneration || !isBleStarting || gattServer == null) return@post
-                recordBle("GATT: зарегистрирован ${service.uuid}, status=$status, характеристики=" +
-                    service.characteristics.joinToString { "${it.uuid}/${it.instanceId}" })
+                recordBle("GATT: зарегистрирован ${service.uuid}, status=$status")
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     stopBlePeripheral()
                     bleStatus = "Ошибка регистрации GATT: $status"
                     refreshStatus()
-                } else if (service.uuid == activeService) {
-                    // Register services sequentially; Android addService is asynchronous.
-                    if (gattServer?.addService(createDeviceInformationService()) != true) {
+                    return@post
+                }
+                val nextService = serviceInitQueue.pollFirst()
+                if (nextService != null) {
+                    if (gattServer?.addService(nextService) != true) {
                         stopBlePeripheral()
-                        bleStatus = "Ошибка регистрации сведений о датчике"
+                        bleStatus = "Ошибка регистрации сервиса ${nextService.uuid}"
                         refreshStatus()
                     }
-                } else if (service.uuid == SERVICE_DEVICE_INFORMATION) {
+                } else {
+                    // Все сервисы (0x1818, 0x180D, 0x180A) добавлены! Запускаем рекламу.
                     advertisePowerService()
                 }
             }
         }
 
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
-            mainHandler.post {
-                if (session != bleGeneration) return@post
-                recordBle("LINK ${peer(device)}: state=$newState, status=$status")
-                if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
-                    connectedDevices.add(device)
-                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    connectedDevices.remove(device)
-                    gattAccessClients.remove(device)
-                    retainedClients.remove(device)
-                    subscribedDevices.remove(device)
-                    notificationQueue.remove(device, disconnected = true)
-                    sendNextNotification()
-                }
-                notifyUi()
+            if (session != bleGeneration) return
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                connectedDevices.add(device)
+                recordBle("LINK UP ${peer(device)}: status=$status")
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                connectedDevices.remove(device)
+                gattAccessClients.remove(device)
+                powerSubscribedDevices.remove(device)
+                heartSubscribedDevices.remove(device)
+                recordBle("LINK DOWN ${peer(device)}: status=$status")
             }
+            mainHandler.post { notifyUi() }
         }
 
-        override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int,
-                                                offset: Int, characteristic: BluetoothGattCharacteristic) {
-            mainHandler.post {
-                if (session != bleGeneration) return@post
-                observeGattAccess(device)
-                recordBle("READ ${peer(device)}: ${characteristic.uuid}/${characteristic.instanceId}, offset=$offset")
-                val bytes = when (characteristic.uuid) {
-                    CHAR_POWER_FEATURE -> byteArrayOf(0, 0, 0, 0)
-                    CHAR_SENSOR_LOCATION -> byteArrayOf(5)
-                    CHAR_MANUFACTURER -> "GlucoPower".toByteArray(Charsets.UTF_8)
-                    CHAR_MODEL -> "Glucose Power Bridge".toByteArray(Charsets.UTF_8)
-                    else -> null
-                }
-                val status = when {
-                    bytes == null -> BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
-                    offset < 0 || offset > bytes.size -> BluetoothGatt.GATT_INVALID_OFFSET
-                    else -> BluetoothGatt.GATT_SUCCESS
-                }
-                gattServer?.sendResponse(device, requestId, status, offset,
-                    if (status == BluetoothGatt.GATT_SUCCESS) bytes!!.copyOfRange(offset, bytes.size) else null)
+        override fun onCharacteristicReadRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            offset: Int,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            if (session != bleGeneration) return
+            observeGattAccess(device)
+
+            // КРИТИЧНО ДЛЯ VIVO X300 ULTRA: отвечаем синхронно прямо в Binder-потоке без mainHandler.post!
+            val bytes = when (characteristic.uuid) {
+                // Bit 3 (0x08) = Crank Revolution Data Supported
+                CHAR_POWER_FEATURE -> byteArrayOf(0x08, 0x00, 0x00, 0x00)
+                CHAR_SENSOR_LOCATION -> byteArrayOf(5) // 5 = Left Crank
+                CHAR_BODY_SENSOR_LOCATION -> byteArrayOf(1) // 1 = Chest
+                CHAR_POWER_MEASUREMENT -> currentPowerPayload()
+                CHAR_HEART_MEASUREMENT -> currentHeartPayload()
+                CHAR_MANUFACTURER -> "GlucoPower".toByteArray(Charsets.UTF_8)
+                CHAR_MODEL -> "GlucoPM".toByteArray(Charsets.UTF_8)
+                else -> null
             }
+            val status = when {
+                bytes == null -> BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
+                offset < 0 || offset > bytes.size -> BluetoothGatt.GATT_INVALID_OFFSET
+                else -> BluetoothGatt.GATT_SUCCESS
+            }
+            val responseSlice = if (status == BluetoothGatt.GATT_SUCCESS) bytes!!.copyOfRange(offset, bytes.size) else null
+            gattServer?.sendResponse(device, requestId, status, offset, responseSlice)
+
+            recordBle("READ ${peer(device)}: ${characteristic.uuid}, offset=$offset, status=$status")
+            mainHandler.post { notifyUi() }
         }
 
-        override fun onDescriptorReadRequest(device: BluetoothDevice, requestId: Int,
-                                             offset: Int, descriptor: BluetoothGattDescriptor) {
-            mainHandler.post {
-                if (session != bleGeneration) return@post
-                observeGattAccess(device)
-                recordBle("READ CCCD ${peer(device)}: ${descriptor.characteristic.uuid}, offset=$offset")
-                val known = descriptor.uuid == CCCD_UUID && descriptor.characteristic.uuid == activeMeasurement
-                val value = if (subscribedDevices.contains(device)) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
-                val status = when {
-                    !known -> BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
-                    offset < 0 || offset > value.size -> BluetoothGatt.GATT_INVALID_OFFSET
-                    else -> BluetoothGatt.GATT_SUCCESS
-                }
-                gattServer?.sendResponse(device, requestId, status, offset,
-                    if (status == BluetoothGatt.GATT_SUCCESS) value.copyOfRange(offset, value.size) else null)
+        override fun onDescriptorReadRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            offset: Int,
+            descriptor: BluetoothGattDescriptor
+        ) {
+            if (session != bleGeneration) return
+            observeGattAccess(device)
+
+            val charUuid = descriptor.characteristic.uuid
+            val known = descriptor.uuid == CCCD_UUID &&
+                (charUuid == CHAR_POWER_MEASUREMENT || charUuid == CHAR_HEART_MEASUREMENT)
+            val isSub = if (charUuid == CHAR_POWER_MEASUREMENT) powerSubscribedDevices.contains(device)
+            else heartSubscribedDevices.contains(device)
+
+            val value = if (isSub) BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            else BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+
+            val status = when {
+                !known -> BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
+                offset < 0 || offset > value.size -> BluetoothGatt.GATT_INVALID_OFFSET
+                else -> BluetoothGatt.GATT_SUCCESS
             }
+            val responseSlice = if (status == BluetoothGatt.GATT_SUCCESS) value.copyOfRange(offset, value.size) else null
+            gattServer?.sendResponse(device, requestId, status, offset, responseSlice)
+
+            recordBle("READ CCCD ${peer(device)}: $charUuid, status=$status")
+            mainHandler.post { notifyUi() }
         }
 
-        override fun onDescriptorWriteRequest(device: BluetoothDevice, requestId: Int,
-                                              descriptor: BluetoothGattDescriptor, preparedWrite: Boolean,
-                                              responseNeeded: Boolean, offset: Int, value: ByteArray) {
+        override fun onDescriptorWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            descriptor: BluetoothGattDescriptor,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray
+        ) {
+            if (session != bleGeneration) return
+            observeGattAccess(device)
+
             val bytes = value.copyOf()
-            mainHandler.post {
-                if (session != bleGeneration) return@post
-                observeGattAccess(device)
-                recordBle("WRITE CCCD ${peer(device)}: ${descriptor.characteristic.uuid}, value=" +
-                    bytes.joinToString("") { "%02x".format(it.toInt() and 255) } +
-                    ", offset=$offset, prepared=$preparedWrite, response=$responseNeeded")
-                val enabled = bytes.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                val disabled = bytes.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)
-                val status = when {
-                    preparedWrite || descriptor.uuid != CCCD_UUID || descriptor.characteristic.uuid != activeMeasurement -> BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
-                    offset != 0 -> BluetoothGatt.GATT_INVALID_OFFSET
-                    bytes.size != 2 -> BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH
-                    !enabled && !disabled -> BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
-                    else -> BluetoothGatt.GATT_SUCCESS
-                }
-                if (responseNeeded && gattServer?.sendResponse(device, requestId, status, 0, null) != true) {
-                    recordBle("CCCD: Android не принял ответ на запись")
-                    return@post
-                }
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    recordBle("CCCD: запись отклонена, status=$status")
-                    return@post
-                }
-                if (enabled) {
-                    subscribedDevices.add(device)
-                    recordBle("SUBSCRIBE ${peer(device)}: уведомления включены")
-                    lastTransfer = "подписка получена"
-                    // Respond to CCCD first, then send the initial sample without waiting for the next tick.
-                    broadcastPowerMeasurement()
-                } else {
-                    subscribedDevices.remove(device)
-                    notificationQueue.remove(device)
-                    recordBle("UNSUBSCRIBE ${peer(device)}")
-                }
-                notifyUi()
+            val charUuid = descriptor.characteristic.uuid
+            val enabled = bytes.isNotEmpty() && (bytes[0].toInt() and 0x03) != 0
+            val disabled = bytes.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)
+
+            val status = when {
+                descriptor.uuid != CCCD_UUID -> BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
+                offset != 0 -> BluetoothGatt.GATT_INVALID_OFFSET
+                else -> BluetoothGatt.GATT_SUCCESS
             }
+
+            // КРИТИЧНО ДЛЯ VIVO X300 ULTRA: отправляем sendResponse МГНОВЕННО в том же потоке!
+            if (responseNeeded) {
+                gattServer?.sendResponse(device, requestId, status, 0, null)
+            }
+
+            recordBle("WRITE CCCD ${peer(device)}: $charUuid, value=" +
+                bytes.joinToString("") { "%02x".format(it.toInt() and 255) } + ", enabled=$enabled")
+
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                if (charUuid == CHAR_POWER_MEASUREMENT) {
+                    if (enabled) {
+                        powerSubscribedDevices.add(device)
+                        lastTransfer = "подписка на Мощность (0x2A63) получена"
+                    } else if (disabled) {
+                        powerSubscribedDevices.remove(device)
+                    }
+                } else if (charUuid == CHAR_HEART_MEASUREMENT) {
+                    if (enabled) {
+                        heartSubscribedDevices.add(device)
+                        lastTransfer = "подписка на ЧСС (0x2A37) получена"
+                    } else if (disabled) {
+                        heartSubscribedDevices.remove(device)
+                    }
+                }
+            }
+
+            // Первое уведомление отправляем через 150 мс после ответа на CCCD, чтобы контроллер Vivo завершил ATT Write Response
+            mainHandler.postDelayed({
+                if (session == bleGeneration) {
+                    broadcastPowerMeasurement()
+                    notifyUi()
+                }
+            }, 150L)
         }
 
         override fun onExecuteWrite(device: BluetoothDevice, requestId: Int, execute: Boolean) {
-            mainHandler.post {
-                if (session != bleGeneration) return@post
-                // All prepared writes are rejected, so this queue is empty.
-                // ATT 3.4.6.3 requires a successful response for an empty queue,
-                // for both Execute and Cancel, without changing any attributes.
-                val status = BluetoothGatt.GATT_SUCCESS
-                recordBle("EXECUTE WRITE ${peer(device)}: execute=$execute, status=$status")
-                gattServer?.sendResponse(device, requestId, status, 0, null)
-            }
+            if (session != bleGeneration) return
+            gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+            recordBle("EXECUTE WRITE ${peer(device)}: execute=$execute")
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
-            mainHandler.post {
-                if (session != bleGeneration || !notificationQueue.complete(device)) return@post
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    completed++
-                    lastTransfer = "Android завершил отправку"
-                    if (completed == 1 || completed % 30 == 0) recordBle("SENT ${peer(device)}: status=0 (#$completed)")
-                } else {
-                    sendErrors++
-                    lastTransfer = "ошибка завершения отправки: $status"
-                    recordBle("SENT ${peer(device)}: status=$status")
+            if (session != bleGeneration) return
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                completed++
+                lastTransfer = "доставлено на велокомпьютер"
+                if (completed == 1 || completed % 30 == 0) {
+                    recordBle("SENT ${peer(device)}: status=0 (#$completed)")
                 }
-                sendNextNotification()
-                notifyUi()
+            } else {
+                sendErrors++
+                lastTransfer = "ошибка доставки: $status"
+                recordBle("SENT ${peer(device)}: status=$status")
             }
+            mainHandler.post { notifyUi() }
         }
     }
 
@@ -1243,12 +1309,17 @@ class GlucoBleBridgeService : Service() {
         val stale = lastReadingTime > 0 && System.currentTimeMillis() - lastReadingTime > 15 * 60000L
         val updateText = "Измерение: ${readingTime()}" + if (stale) " — нет свежих данных" else ""
         val details = if (mode.test) "${outputText()}.\nДля возврата нажмите «Запустить датчик мощности».\nBLE: $bleStatus\n${transferStage()}"
-            else "$text\n$updateText\nBLE: $bleStatus\nПодписки: ${subscribedDevices.size}; ${transferStage()}"
-        val openApp = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        else "$text\n$updateText\nBLE: $bleStatus\nПодписки: ${subscribedDevices.size}; ${transferStage()}"
+        val openApp = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         return builder
-            .setContentTitle(if (mode.test) "GlucoPower: ${outputText()}" else if (lastReadingTime == 0L) "GlucoPower: ожидание xDrip+" else
-                String.format("%.1f ммоль/л → %s", currentMmol, outputText()))
+            .setContentTitle(
+                if (mode.test) "GlucoPower: ${outputText()}"
+                else if (lastReadingTime == 0L) "GlucoPower: ожидание xDrip+"
+                else String.format("%.1f ммоль/л → %s", currentMmol, outputText())
+            )
             .setContentText(if (mode.test) "ТЕСТ BLE, не реальные данные" else updateText)
             .setStyle(Notification.BigTextStyle().bigText(details))
             .setWhen(lastReadingTime)
