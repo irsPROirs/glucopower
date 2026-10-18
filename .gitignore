@@ -1,5 +1,12 @@
 .gradle/
+.kotlin/
 .tools/
 local.properties
 **/build/
 *.apk
+*.keystore
+*.jks
+.codex-remote-attachments/
+/diagnostics/
+__pycache__/
+*.pyc

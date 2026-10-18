@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<macro name="Cycling Power 93 W" icon="PLAY">
+    <send-notification
+        service-uuid="00001818-0000-1000-8000-00805f9b34fb"
+        characteristic-uuid="00002a63-0000-1000-8000-00805f9b34fb"
+        value="00005D00" />
+    <sleep timeout="1000" />
+</macro>

@@ -22,8 +22,8 @@ class BridgeProtocolTest {
     }
     @Test fun scanResponseNameRespectsUtf8ByteLimit() {
         assertTrue(BridgeProtocol.canIncludeName("GlucoPower"))
-        assertTrue(BridgeProtocol.canIncludeName("x".repeat(29)))
-        assertFalse(BridgeProtocol.canIncludeName("x".repeat(30)))
+        assertTrue(BridgeProtocol.canIncludeName("x".repeat(25)))
+        assertFalse(BridgeProtocol.canIncludeName("x".repeat(26)))
         assertFalse(BridgeProtocol.canIncludeName("Я".repeat(15)))
         assertFalse(BridgeProtocol.canIncludeName(null))
     }
@@ -47,6 +47,9 @@ class BridgeProtocolTest {
     }
     @Test fun savedModeRestoresAndUnknownModeDefaultsToPower() {
         assertEquals(BridgeMode.HEART_GLUCOSE, BridgeMode.restore("HEART_GLUCOSE"))
+        assertEquals(BridgeMode.POWER_TEST, BridgeMode.restore("POWER_TEST"))
+        assertFalse(BridgeMode.POWER_TEST.heartProfile)
+        assertTrue(BridgeMode.POWER_TEST.test)
         assertEquals(BridgeMode.POWER, BridgeMode.restore(null))
         assertEquals(BridgeMode.POWER, BridgeMode.restore("unknown"))
     }
