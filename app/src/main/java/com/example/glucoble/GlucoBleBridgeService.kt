@@ -238,7 +238,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 if (ensureBlePermissions()) startBridgeService(BridgeMode.HEART_TEST)
             }
-        }))
+        })
 
         val btnStop = Button(this).apply {
             text = "Остановить трансляцию"
