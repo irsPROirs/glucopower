@@ -21,6 +21,7 @@ jobs:
 
       - name: Generate Project Structure & Source Files
         run: |
+          rm -rf app settings.gradle.kts build.gradle.kts gradle.properties
           mkdir -p app/src/main/java/com/example/glucoble
 
           cat << 'EOF' > settings.gradle.kts
@@ -97,8 +98,7 @@ jobs:
 
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-              package="com.example.glucoble">
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.BLUETOOTH" />
               <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
@@ -133,6 +133,8 @@ jobs:
               </application>
           </manifest>
           EOF
+          # Удаляем ведущие пробелы в AndroidManifest.xml, чтобы избежать ошибки XML-пролога
+          sed -i 's/^[[:space:]]*//' app/src/main/AndroidManifest.xml
 
           cat << 'EOF' > app/src/main/java/com/example/glucoble/MainActivity.kt
           package com.example.glucoble
@@ -203,13 +205,13 @@ jobs:
                   layout.addView(btnStart)
 
                   val btnTest = Button(this).apply {
-                      text = "Отправить тест (145W)"
+                      text = "Отправить тест (случайные 110..160W)"
                       setOnClickListener {
                           val i = Intent(this@MainActivity, GlucoBleBridgeService::class.java).apply {
                               action = GlucoBleBridgeService.ACTION_TEST_DATA
                               putExtra("value", (110..160).random())
                           }
-                          startService(i)
+                          ContextCompat.startForegroundService(this@MainActivity, i)
                       }
                   }
                   layout.addView(btnTest)
@@ -324,11 +326,9 @@ jobs:
                   const val ACTION_UI_STATUS = "com.example.glucoble.UI_STATUS"
                   const val ACTION_TEST_DATA = "com.example.glucoble.TEST_DATA"
 
-                  // xDrip Broadcast
                   private const val ACTION_XDRIP_BG = "com.eveningoutpost.dexdrip.BgEstimate"
                   private const val EXTRA_BG_ESTIMATE = "com.eveningoutpost.dexdrip.Extras.BgEstimate"
 
-                  // Cycling Power Service (0x1818) UUIDs
                   val CPS_SERVICE_UUID: UUID = UUID.fromString("00001818-0000-1000-8000-00805f9b34fb")
                   val CPS_MEASUREMENT_UUID: UUID = UUID.fromString("00002a63-0000-1000-8000-00805f9b34fb")
                   val CPS_FEATURE_UUID: UUID = UUID.fromString("00002a65-0000-1000-8000-00805f9b34fb")
@@ -489,7 +489,6 @@ jobs:
                       .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
                       .build()
 
-                  // Без имени в основном пакете, чтобы уложиться в 31 байт на Vivo
                   val advertiseData = AdvertiseData.Builder()
                       .setIncludeDeviceName(false)
                       .setIncludeTxPowerLevel(false)
@@ -540,7 +539,7 @@ jobs:
                               logToUi("Чтение Feature (0x2A65) от ${device.address}")
                           }
                           SENSOR_LOCATION_UUID -> {
-                              val locationBytes = byteArrayOf(0x05) // 5 = Left Crank
+                              val locationBytes = byteArrayOf(0x05)
                               gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, locationBytes)
                               logToUi("Чтение Sensor Location (0x2A5D) от ${device.address}")
                           }
@@ -599,7 +598,7 @@ jobs:
                   lastCrankEventTime = (lastCrankEventTime + 1024) and 0xFFFF
 
                   val payload = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).apply {
-                      putShort(0x0020.toShort()) // Flags: Crank Revolution Data Present
+                      putShort(0x0020.toShort())
                       putShort(currentGlucoseWatts.coerceIn(0, 2000).toShort())
                       putShort(cumulativeCrankRevs.toShort())
                       putShort(lastCrankEventTime.toShort())
@@ -664,9 +663,13 @@ jobs:
           }
           EOF
 
-      - name: Build Debug APK with Gradle
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
-      - run: gradle assembleDebug --no-daemon
+        with:
+          gradle-version: '8.5'
+
+      - name: Build Debug APK with Gradle
+        run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
