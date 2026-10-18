@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "GlucoBLE_Power"
+rootProject.name = "GlucoPower"
 include(":app")
