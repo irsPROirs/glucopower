@@ -1,0 +1,769 @@
+name: Build GlucoPower APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle 8.5
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Generate Android project & Compile APK
+        run: |
+          mkdir -p app/src/main/java/com/example/glucoble
+
+          cat << 'EOF_SETTINGS' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GlucoPower"
+          include(":app")
+          EOF_SETTINGS
+
+          cat << 'EOF_ROOT_GRADLE' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF_ROOT_GRADLE
+
+          cat << 'EOF_PROPS' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF_PROPS
+
+          cat << 'EOF_APP_GRADLE' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          
+          android {
+              namespace = "com.example.glucoble"
+              compileSdk = 34
+          
+              defaultConfig {
+                  applicationId = "com.example.glucoble"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+          
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+          
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          
+          dependencies {
+              // Используются только стандартные Android SDK API (BluetoothGattServer, BroadcastReceiver, HttpURLConnection),
+              // поэтому внешние библиотеки не требуются.
+          }
+          EOF_APP_GRADLE
+
+          cat << 'EOF_MANIFEST' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.example.glucoble">
+          
+              <!-- Разрешения для работы BLE Peripheral (GATT-сервера) и рекламы датчика -->
+              <uses-permission android:name="android.permission.BLUETOOTH" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+          
+              <!-- Разрешения для работы фонового сервиса во время поездки -->
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+          
+              <!-- Разрешение для резервного чтения локального веб-сервера xDrip+ / GlucoDataHandler (127.0.0.1:17580) -->
+              <uses-permission android:name="android.permission.INTERNET" />
+          
+              <uses-feature
+                  android:name="android.hardware.bluetooth_le"
+                  android:required="true" />
+          
+              <!-- Для Android 11+ (API 30+) открываем видимость пакетов GlucoDataHandler, xDrip+ и Juggluco -->
+              <queries>
+                  <package android:name="de.michelinside.glucodatahandler" />
+                  <package android:name="com.eveningoutpost.dexdrip" />
+                  <package android:name="tk.glucodata" />
+              </queries>
+          
+              <application
+                  android:label="GlucoBLE Bridge"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+          
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+          
+                  <service
+                      android:name=".GlucoBleBridgeService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="connectedDevice" />
+          
+              </application>
+          </manifest>
+          EOF_MANIFEST
+
+          cat << 'EOF_KOTLIN' > app/src/main/java/com/example/glucoble/GlucoBleBridgeService.kt
+          package com.example.glucoble
+          
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.bluetooth.BluetoothAdapter
+          import android.bluetooth.BluetoothDevice
+          import android.bluetooth.BluetoothGatt
+          import android.bluetooth.BluetoothGattCharacteristic
+          import android.bluetooth.BluetoothGattDescriptor
+          import android.bluetooth.BluetoothGattServer
+          import android.bluetooth.BluetoothGattServerCallback
+          import android.bluetooth.BluetoothGattService
+          import android.bluetooth.BluetoothManager
+          import android.bluetooth.BluetoothProfile
+          import android.bluetooth.le.AdvertiseCallback
+          import android.bluetooth.le.AdvertiseData
+          import android.bluetooth.le.AdvertiseSettings
+          import android.bluetooth.le.BluetoothLeAdvertiser
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.ParcelUuid
+          import android.util.Log
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import org.json.JSONArray
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import java.util.UUID
+          import java.util.concurrent.Executors
+          import kotlin.math.roundToInt
+          
+          /**
+           * Главный экран приложения GlucoBLE Power Bridge.
+           * Настроен специально на передачу глюкозы (ммоль/л) в поле «Мощность (Вт)» на велокомпьютер Geoid CC600.
+           */
+          class MainActivity : Activity() {
+          
+              private lateinit var statusText: TextView
+              private lateinit var checkMultiply10: CheckBox
+          
+              private val uiReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      if (intent?.action == GlucoBleBridgeService.ACTION_UI_UPDATE) {
+                          val mmol = intent.getDoubleExtra("mmol", 0.0)
+                          val watts = intent.getIntExtra("watts", 0)
+                          val source = intent.getStringExtra("source") ?: "ожидание"
+                          val connected = intent.getIntExtra("connected", 0)
+                          statusText.text = String.format(
+                              "Текущий сахар: %.1f ммоль/л\nПередаётся мощность: %d Вт\nИсточник: %s\nПодключено велокомпьютеров: %d",
+                              mmol, watts, source, connected
+                          )
+                      }
+                  }
+              }
+          
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+          
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 48, 48, 48)
+                      gravity = Gravity.CENTER_HORIZONTAL
+                  }
+          
+                  val titleView = TextView(this).apply {
+                      text = "GlucoBLE → Geoid CC600 (Мощность)"
+                      textSize = 20f
+                      setPadding(0, 0, 0, 24)
+                  }
+                  root.addView(titleView)
+          
+                  statusText = TextView(this).apply {
+                      text = "Статус: сервис не запущен\nНа примере вашего скрина: 9.3 ммоль/л → 93 Вт"
+                      textSize = 16f
+                      setPadding(0, 0, 0, 24)
+                  }
+                  root.addView(statusText)
+          
+                  checkMultiply10 = CheckBox(this).apply {
+                      text = "Умножать ммоль/л на 10 (9.3 ммоль/л → 93 Вт)"
+                      isChecked = true
+                      setPadding(0, 16, 0, 24)
+                  }
+                  root.addView(checkMultiply10)
+          
+                  val btnStart = Button(this).apply {
+                      text = "1. Запустить датчик мощности (GlucoPower)"
+                      setOnClickListener {
+                          if (ensureBlePermissions()) {
+                              startBridgeService(null)
+                          }
+                      }
+                  }
+                  root.addView(btnStart)
+          
+                  val btnTest = Button(this).apply {
+                      text = "2. Тест: отправить 9.3 ммоль/л (93 Вт)"
+                      setOnClickListener {
+                          if (ensureBlePermissions()) {
+                              startBridgeService(9.3)
+                          }
+                      }
+                  }
+                  root.addView(btnTest)
+          
+                  val btnStop = Button(this).apply {
+                      text = "Остановить трансляцию"
+                      setOnClickListener {
+                          stopService(Intent(this@MainActivity, GlucoBleBridgeService::class.java))
+                          statusText.text = "Статус: трансляция остановлена"
+                          Toast.makeText(this@MainActivity, "Трансляция остановлена", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  root.addView(btnStop)
+          
+                  setContentView(root)
+              }
+          
+              override fun onResume() {
+                  super.onResume()
+                  val filter = IntentFilter(GlucoBleBridgeService.ACTION_UI_UPDATE)
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      registerReceiver(uiReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                  } else {
+                      registerReceiver(uiReceiver, filter)
+                  }
+              }
+          
+              override fun onPause() {
+                  runCatching { unregisterReceiver(uiReceiver) }
+                  super.onPause()
+              }
+          
+              private fun ensureBlePermissions(): Boolean {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      val needed = mutableListOf(
+                          Manifest.permission.BLUETOOTH_ADVERTISE,
+                          Manifest.permission.BLUETOOTH_CONNECT
+                      )
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                          needed.add(Manifest.permission.POST_NOTIFICATIONS)
+                      }
+                      val missing = needed.filter {
+                          checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+                      }
+                      if (missing.isNotEmpty()) {
+                          requestPermissions(missing.toTypedArray(), 101)
+                          return false
+                      }
+                  }
+                  return true
+              }
+          
+              private fun startBridgeService(testMmol: Double?) {
+                  val serviceIntent = Intent(this, GlucoBleBridgeService::class.java).apply {
+                      putExtra(GlucoBleBridgeService.EXTRA_MULTIPLY_BY_10, checkMultiply10.isChecked)
+                      if (testMmol != null) {
+                          putExtra(GlucoBleBridgeService.EXTRA_TEST_MMOL, testMmol)
+                      }
+                  }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      startForegroundService(serviceIntent)
+                  } else {
+                      startService(serviceIntent)
+                  }
+                  Toast.makeText(this, "BLE-датчик мощности GlucoPower активен", Toast.LENGTH_SHORT).show()
+              }
+          }
+          
+          /**
+           * Фоновый сервис, принимающий глюкозу из xDrip+ / GlucoDataHandler и транслирующий её
+           * по стандартному профилю BLE Cycling Power (UUID 0x1818, характеристика 0x2A63) на Geoid CC600.
+           */
+          @SuppressLint("MissingPermission")
+          class GlucoBleBridgeService : Service() {
+          
+              companion object {
+                  private const val TAG = "GlucoBleBridge"
+                  private const val CHANNEL_ID = "gluco_ble_power_channel"
+                  private const val NOTIFICATION_ID = 1001
+          
+                  // Почему используется 18.0182:
+                  // Внутри кода Android-трансляций (Broadcast) xDrip+ всегда передаёт сырое число в мг/дл (mg/dL),
+                  // даже если на экране телефона выбраны ммоль/л. Например, при сахаре 9.3 ммоль/л xDrip+ присылает
+                  // число 167.57 (левая шкала графика). Деление на 18.0182 переводит 167.57 обратно в 9.3 ммоль/л.
+                  private const val MGDL_TO_MMOL = 18.0182
+          
+                  const val EXTRA_MULTIPLY_BY_10 = "extra_multiply_by_10"
+                  const val EXTRA_TEST_MMOL = "extra_test_mmol"
+                  const val ACTION_UI_UPDATE = "com.example.glucoble.UI_UPDATE"
+          
+                  // 1. Локальная трансляция xDrip+ (включена у вас на 2-м скриншоте)
+                  private const val ACTION_XDRIP_BG = "com.eveningoutpost.dexdrip.BgEstimate"
+                  private const val EXTRA_XDRIP_BG_MGDL = "com.eveningoutpost.dexdrip.Extras.BgEstimate"
+          
+                  // 2. Трансляция GlucoDataHandler / Juggluco
+                  private const val ACTION_GLUCODATA_MINUTE = "glucodata.Minute"
+                  private const val ACTION_GDH_GLUCODATA = "de.michelinside.glucodatahandler.GLUCODATA"
+                  private const val EXTRA_GLUCODATA_MGDL = "glucodata.Minute.mgdl"
+                  private const val EXTRA_GLUCODATA_CUSTOM = "glucodata.Minute.glucose"
+          
+                  // Стандартные 16-битные UUID Bluetooth SIG для датчика мощности (Cycling Power)
+                  private fun bleUuid(shortUuid: Int): UUID =
+                      UUID.fromString(String.format("0000%04x-0000-1000-8000-00805f9b34fb", shortUuid))
+          
+                  val CCCD_UUID: UUID = bleUuid(0x2902)
+                  val SERVICE_CYCLING_POWER: UUID = bleUuid(0x1818)
+                  val CHAR_POWER_MEASUREMENT: UUID = bleUuid(0x2A63)
+                  val CHAR_POWER_FEATURE: UUID = bleUuid(0x2A65)
+                  val CHAR_SENSOR_LOCATION: UUID = bleUuid(0x2A5D)
+              }
+          
+              private var bluetoothManager: BluetoothManager? = null
+              private var gattServer: BluetoothGattServer? = null
+              private var advertiser: BluetoothLeAdvertiser? = null
+              private val subscribedDevices = mutableSetOf<BluetoothDevice>()
+          
+              private var multiplyBy10: Boolean = true
+              private var isBleRunning: Boolean = false
+          
+              @Volatile
+              private var currentMmol: Double = 9.3
+          
+              @Volatile
+              private var lastSource: String = "ожидание пакета от xDrip+ / GDH"
+          
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private val httpExecutor = Executors.newSingleThreadScheduledExecutor()
+          
+              // Ежесекундная отправка мощности (Вт) на велокомпьютер Geoid CC600
+              private val bleTickRunnable = object : Runnable {
+                  override fun run() {
+                      broadcastPowerMeasurement()
+                      notifyUi()
+                      mainHandler.postDelayed(this, 1000L)
+                  }
+              }
+          
+              // Приёмник широковещательных пакетов от xDrip+ и GlucoDataHandler
+              private val glucoseReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      val action = intent?.action ?: return
+                      val extras = intent.extras ?: return
+          
+                      when (action) {
+                          ACTION_XDRIP_BG -> {
+                              val mgdl = extras.getDouble(EXTRA_XDRIP_BG_MGDL, Double.NaN)
+                              if (!mgdl.isNaN() && mgdl > 0) {
+                                  updateGlucoseValue(mgdl, "xDrip+ Broadcast")
+                              }
+                          }
+                          ACTION_GLUCODATA_MINUTE, ACTION_GDH_GLUCODATA -> {
+                              val custom = extras.getFloat(EXTRA_GLUCODATA_CUSTOM, Float.NaN)
+                              val mgdl = extras.getInt(EXTRA_GLUCODATA_MGDL, -1)
+                              if (!custom.isNaN() && custom > 0f) {
+                                  updateGlucoseValue(custom.toDouble(), "GlucoDataHandler")
+                              } else if (mgdl > 0) {
+                                  updateGlucoseValue(mgdl.toDouble(), "GlucoDataHandler (mg/dL)")
+                              }
+                          }
+                      }
+                  }
+              }
+          
+              override fun onCreate() {
+                  super.onCreate()
+                  createNotificationChannel()
+                  registerGlucoseBroadcasts()
+                  startLocalWebServerPoller()
+              }
+          
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  multiplyBy10 = intent?.getBooleanExtra(EXTRA_MULTIPLY_BY_10, true) ?: true
+                  if (intent?.hasExtra(EXTRA_TEST_MMOL) == true) {
+                      val testVal = intent.getDoubleExtra(EXTRA_TEST_MMOL, 9.3)
+                      updateGlucoseValue(testVal, "Тестовый сигнал")
+                  }
+          
+                  startForeground(NOTIFICATION_ID, buildNotification())
+                  if (!isBleRunning) {
+                      startBlePowerPeripheral()
+                  }
+          
+                  mainHandler.removeCallbacks(bleTickRunnable)
+                  mainHandler.post(bleTickRunnable)
+          
+                  return START_STICKY
+              }
+          
+              override fun onDestroy() {
+                  mainHandler.removeCallbacks(bleTickRunnable)
+                  httpExecutor.shutdownNow()
+                  runCatching { unregisterReceiver(glucoseReceiver) }
+                  stopBlePeripheral()
+                  super.onDestroy()
+              }
+          
+              override fun onBind(intent: Intent?): IBinder? = null
+          
+              private fun registerGlucoseBroadcasts() {
+                  val filter = IntentFilter().apply {
+                      addAction(ACTION_XDRIP_BG)
+                      addAction(ACTION_GLUCODATA_MINUTE)
+                      addAction(ACTION_GDH_GLUCODATA)
+                  }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      registerReceiver(glucoseReceiver, filter, Context.RECEIVER_EXPORTED)
+                  } else {
+                      registerReceiver(glucoseReceiver, filter)
+                  }
+              }
+          
+              /**
+               * Автоматическое определение единиц:
+               * - Если пришло число > 35 (например, 168 из внутренней трансляции xDrip+ в мг/дл),
+               *   делим его на 18.0182 и получаем 9.3 ммоль/л.
+               * - Если пришло число <= 35 (например, уже готовые 9.3 ммоль/л из GlucoDataHandler),
+               *   используем его напрямую без деления.
+               */
+              private fun updateGlucoseValue(rawValue: Double, source: String) {
+                  val mmol = if (rawValue > 35.0) rawValue / MGDL_TO_MMOL else rawValue
+                  currentMmol = mmol
+                  lastSource = source
+                  Log.d(TAG, String.format("Глюкоза (%s): %.1f ммоль/л -> %d Вт", source, mmol, getWattsValue()))
+                  mainHandler.post {
+                      val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      nm.notify(NOTIFICATION_ID, buildNotification())
+                      notifyUi()
+                  }
+              }
+          
+              private fun getWattsValue(): Int {
+                  val raw = if (multiplyBy10) (currentMmol * 10.0).roundToInt() else currentMmol.roundToInt()
+                  return raw.coerceIn(10, 400)
+              }
+          
+              private fun notifyUi() {
+                  val uiIntent = Intent(ACTION_UI_UPDATE).apply {
+                      setPackage(packageName)
+                      putExtra("mmol", currentMmol)
+                      putExtra("watts", getWattsValue())
+                      putExtra("source", lastSource)
+                      putExtra("connected", subscribedDevices.size)
+                  }
+                  sendBroadcast(uiIntent)
+              }
+          
+              /**
+               * Резервный опрос встроенного веб-сервера xDrip+ / GlucoDataHandler (127.0.0.1:17580/sgv.json).
+               */
+              private fun startLocalWebServerPoller() {
+                  httpExecutor.scheduleWithFixedDelay({
+                      try {
+                          val url = URL("http://127.0.0.1:17580/sgv.json?count=1")
+                          val conn = (url.openConnection() as HttpURLConnection).apply {
+                              connectTimeout = 2000
+                              readTimeout = 2000
+                              requestMethod = "GET"
+                          }
+                          if (conn.responseCode == 200) {
+                              val body = conn.inputStream.bufferedReader().use { it.readText() }
+                              val jsonArray = JSONArray(body)
+                              if (jsonArray.length() > 0) {
+                                  val sgvMgdl = jsonArray.getJSONObject(0).optDouble("sgv", Double.NaN)
+                                  if (!sgvMgdl.isNaN() && sgvMgdl > 0) {
+                                      updateGlucoseValue(sgvMgdl, "Локальный сервер :17580")
+                                  }
+                              }
+                          }
+                          conn.disconnect()
+                      } catch (_: Exception) {
+                          // Игнорируем, если используется обычная локальная трансляция
+                      }
+                  }, 2, 15, java.util.concurrent.TimeUnit.SECONDS)
+              }
+          
+              // ========================================================================
+              // BLE GATT Server — Профиль датчика мощности (Cycling Power 0x1818)
+              // ========================================================================
+          
+              private fun startBlePowerPeripheral() {
+                  stopBlePeripheral()
+          
+                  bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+                  val adapter: BluetoothAdapter = bluetoothManager?.adapter ?: return
+                  if (!adapter.isEnabled) return
+          
+                  // Имя датчика в меню привязки велокомпьютера Geoid CC600
+                  runCatching { adapter.name = "GlucoPower" }
+          
+                  gattServer = bluetoothManager?.openGattServer(this, gattServerCallback)
+                  gattServer?.addService(createCyclingPowerService())
+          
+                  advertiser = adapter.bluetoothLeAdvertiser
+                  val settings = AdvertiseSettings.Builder()
+                      .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+                      .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+                      .setConnectable(true)
+                      .build()
+          
+                  val data = AdvertiseData.Builder()
+                      .setIncludeDeviceName(true)
+                      .addServiceUuid(ParcelUuid(SERVICE_CYCLING_POWER))
+                      .build()
+          
+                  advertiser?.startAdvertising(settings, data, advertiseCallback)
+                  isBleRunning = true
+              }
+          
+              private fun stopBlePeripheral() {
+                  runCatching { advertiser?.stopAdvertising(advertiseCallback) }
+                  runCatching { gattServer?.close() }
+                  subscribedDevices.clear()
+                  isBleRunning = false
+              }
+          
+              private fun createCyclingPowerService(): BluetoothGattService {
+                  val service = BluetoothGattService(SERVICE_CYCLING_POWER, BluetoothGattService.SERVICE_TYPE_PRIMARY)
+          
+                  // Характеристика измерения мощности (0x2A63) — Notify
+                  val measurement = BluetoothGattCharacteristic(
+                      CHAR_POWER_MEASUREMENT,
+                      BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                      0
+                  )
+                  measurement.addDescriptor(
+                      BluetoothGattDescriptor(
+                          CCCD_UUID,
+                          BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+                      )
+                  )
+          
+                  // Характеристика возможностей датчика мощности (0x2A65) — Read (4 байта = 0)
+                  val feature = BluetoothGattCharacteristic(
+                      CHAR_POWER_FEATURE,
+                      BluetoothGattCharacteristic.PROPERTY_READ,
+                      BluetoothGattCharacteristic.PERMISSION_READ
+                  )
+          
+                  // Расположение датчика (0x2A5D) — Read (1 байт = 5: Left Crank / Левый шатун)
+                  val location = BluetoothGattCharacteristic(
+                      CHAR_SENSOR_LOCATION,
+                      BluetoothGattCharacteristic.PROPERTY_READ,
+                      BluetoothGattCharacteristic.PERMISSION_READ
+                  )
+          
+                  service.addCharacteristic(measurement)
+                  service.addCharacteristic(feature)
+                  service.addCharacteristic(location)
+                  return service
+              }
+          
+              private fun broadcastPowerMeasurement() {
+                  val server = gattServer ?: return
+                  if (subscribedDevices.isEmpty()) return
+          
+                  val watts = getWattsValue()
+          
+                  // Стандарт Bluetooth SIG 0x2A63 (Cycling Power Measurement):
+                  // Байты 0..1: Flags (uint16 = 0x0000, без дополнительных полей)
+                  // Байты 2..3: Instantaneous Power в Ваттах (sint16, Little Endian)
+                  val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+                  buf.putShort(0)
+                  buf.putShort(watts.toShort())
+          
+                  val characteristic = server
+                      .getService(SERVICE_CYCLING_POWER)
+                      ?.getCharacteristic(CHAR_POWER_MEASUREMENT) ?: return
+          
+                  characteristic.value = buf.array()
+                  for (device in subscribedDevices.toList()) {
+                      runCatching {
+                          server.notifyCharacteristicChanged(device, characteristic, false)
+                      }
+                  }
+              }
+          
+              private val advertiseCallback = object : AdvertiseCallback() {
+                  override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+                      Log.i(TAG, "BLE Advertising датчика мощности (GlucoPower) запущен")
+                  }
+          
+                  override fun onStartFailure(errorCode: Int) {
+                      Log.e(TAG, "Ошибка запуска BLE Advertising: $errorCode")
+                  }
+              }
+          
+              private val gattServerCallback = object : BluetoothGattServerCallback() {
+                  override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+                      if (newState == BluetoothProfile.STATE_CONNECTED) {
+                          Log.i(TAG, "Geoid CC600 подключился: ${device.address}")
+                      } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                          Log.i(TAG, "Geoid CC600 отключился: ${device.address}")
+                          subscribedDevices.remove(device)
+                          notifyUi()
+                      }
+                  }
+          
+                  override fun onCharacteristicReadRequest(
+                      device: BluetoothDevice,
+                      requestId: Int,
+                      offset: Int,
+                      characteristic: BluetoothGattCharacteristic
+                  ) {
+                      val responseBytes = when (characteristic.uuid) {
+                          CHAR_POWER_FEATURE -> byteArrayOf(0x00, 0x00, 0x00, 0x00)
+                          CHAR_SENSOR_LOCATION -> byteArrayOf(0x05) // Left Crank
+                          else -> byteArrayOf(0x00)
+                      }
+                      gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, responseBytes)
+                  }
+          
+                  override fun onDescriptorWriteRequest(
+                      device: BluetoothDevice,
+                      requestId: Int,
+                      descriptor: BluetoothGattDescriptor,
+                      preparedWrite: Boolean,
+                      responseNeeded: Boolean,
+                      offset: Int,
+                      value: ByteArray
+                  ) {
+                      if (descriptor.uuid == CCCD_UUID) {
+                          if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
+                              subscribedDevices.add(device)
+                              Log.i(TAG, "Geoid CC600 подписался на уведомления мощности")
+                              notifyUi()
+                          } else if (value.contentEquals(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE)) {
+                              subscribedDevices.remove(device)
+                              notifyUi()
+                          }
+                      }
+                      if (responseNeeded) {
+                          gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+                      }
+                  }
+              }
+          
+              private fun createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          CHANNEL_ID,
+                          "GlucoBLE Датчик мощности",
+                          NotificationManager.IMPORTANCE_LOW
+                      )
+                      val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      nm.createNotificationChannel(channel)
+                  }
+              }
+          
+              private fun buildNotification(): Notification {
+                  val text = String.format(
+                      "Сахар: %.1f ммоль/л → на Geoid CC600: %d Вт (%s)",
+                      currentMmol,
+                      getWattsValue(),
+                      lastSource
+                  )
+                  val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      Notification.Builder(this, CHANNEL_ID)
+                  } else {
+                      @Suppress("DEPRECATION")
+                      Notification.Builder(this)
+                  }
+                  return builder
+                      .setContentTitle("GlucoPower активен")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                      .setOngoing(true)
+                      .build()
+              }
+          }
+          EOF_KOTLIN
+
+          gradle assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk GlucoPower.apk
+
+      - name: Upload GlucoPower.apk to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlucoPower-APK
+          path: GlucoPower.apk
+
+      - name: Publish GlucoPower.apk to Releases (Direct Download)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "GlucoPower APK (сборка #${{ github.run_number }})"
+          body: "Нажмите на файл **GlucoPower.apk** ниже, чтобы скачать и установить приложение на Android."
+          files: GlucoPower.apk
