@@ -78,6 +78,11 @@ Save-AdbText -Name 'glucopower-logcat.txt' -AdbArguments @('logcat', '-d', '-v',
 Save-AdbText -Name 'hci-log-mode.txt' -AdbArguments @('shell', 'getprop', 'persist.bluetooth.btsnooplogmode')
 Save-AdbText -Name 'phone-model.txt' -AdbArguments @('shell', 'getprop', 'ro.product.model')
 Save-AdbText -Name 'phone-firmware.txt' -AdbArguments @('shell', 'getprop', 'ro.build.fingerprint')
+Save-AdbText -Name 'android-release.txt' -AdbArguments @('shell', 'getprop', 'ro.build.version.release')
+Save-AdbText -Name 'android-sdk.txt' -AdbArguments @('shell', 'getprop', 'ro.build.version.sdk')
+Save-AdbText -Name 'android-sdk-full.txt' -AdbArguments @('shell', 'getprop', 'ro.build.version.sdk_full')
+Save-AdbText -Name 'phone-display.txt' -AdbArguments @('shell', 'getprop', 'ro.build.display.id')
+Save-AdbText -Name 'lineage-version.txt' -AdbArguments @('shell', 'getprop', 'ro.lineage.version')
 
 $bugreportPath = Join-Path $outputDirectory 'bugreport.zip'
 Write-Host 'Collecting Android bugreport; this can take several minutes...'

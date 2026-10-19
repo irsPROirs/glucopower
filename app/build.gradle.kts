@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.glucoble"
         minSdk = 26
         targetSdk = 34
-        versionCode = 12
-        versionName = "1.11"
+        versionCode = 16
+        versionName = "1.15"
     }
 
     buildTypes {

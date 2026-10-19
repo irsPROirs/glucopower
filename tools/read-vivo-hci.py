@@ -27,7 +27,10 @@ ADV_COMMANDS = {0x2005: "LE_Set_Random_Address", 0x2006: "LE_Set_Advertising_Par
     0x2009: "LE_Set_Scan_Response_Data", 0x200A: "LE_Set_Advertising_Enable",
     0x2035: "LE_Set_Advertising_Set_Random_Address", 0x2036: "LE_Set_Extended_Advertising_Parameters", 0x2037: "LE_Set_Extended_Advertising_Data",
     0x2038: "LE_Set_Extended_Scan_Response_Data", 0x2039: "LE_Set_Extended_Advertising_Enable",
-    0x203C: "LE_Remove_Advertising_Set", 0x203D: "LE_Clear_Advertising_Sets"}
+    0x203C: "LE_Remove_Advertising_Set", 0x203D: "LE_Clear_Advertising_Sets",
+    0xFD54: "LE_Multi_Advt"}
+MULTI_ADV_SUBCOMMANDS = {1: "Set_Parameters", 2: "Set_Advertising_Data",
+    3: "Set_Scan_Response_Data", 4: "Set_Random_Address", 5: "Set_Enable"}
 
 def u16(b): return int.from_bytes(b, "little")
 def hx(n): return f"0x{n:04x}"
@@ -105,7 +108,30 @@ class Reader:
             self.ad_fragments.clear()
         if op in ADV_COMMANDS:
             e = dict(base, command=ADV_COMMANDS[op], opcode=hx(op))
-            if op in (0x2005,0x2035) and len(b) >= (6 if op == 0x2005 else 7):
+            if op == 0xFD54 and b:
+                # Android vendor multi-advertiser specification, not an extended
+                # advertising PDU. Parameters include Own_Address before Peer_Address.
+                # https://source.android.com/docs/core/connect/bluetooth/hci_requirements#multi-advertiser-support
+                e.update(subcommand=b[0], subcommand_name=MULTI_ADV_SUBCOMMANDS.get(b[0], "Unknown"))
+                if b[0] == 1 and len(b) == 24:
+                    e.update(interval_min_ms=u16(b[1:3])*.625,
+                        interval_max_ms=u16(b[3:5])*.625, adv_type=b[5],
+                        legacy_pdu=True, connectable=b[5] in (0,1,4),
+                        scannable=b[5] in (0,2), directed=b[5] in (1,4),
+                        own_address_type=b[6], address_id=addr_id(b[7:13]),
+                        directed_peer_present=any(b[14:20]), channel_map=b[20],
+                        filter_policy=b[21], advertising_handle=b[22],
+                        requested_tx_dbm=struct.unpack("b",b[23:24])[0], primary_phy=1)
+                elif b[0] in (2,3) and len(b) == 34 and b[1] <= 31:
+                    e.update(advertising_handle=b[33], data=ad_metadata(b[2:2+b[1]]))
+                elif b[0] == 4 and len(b) == 8:
+                    e.update(advertising_handle=b[7], address_id=addr_id(b[1:7]),
+                        random_address_kind={0:"NRPA",1:"RPA",3:"static"}.get(b[6] >> 6,"reserved"))
+                elif b[0] == 5 and len(b) == 3:
+                    e.update(advertising_handle=b[2], enabled=bool(b[1]))
+                else:
+                    e["unsupported_parameter_length"] = len(b)
+            elif op in (0x2005,0x2035) and len(b) >= (6 if op == 0x2005 else 7):
                 address=b[:6] if op == 0x2005 else b[1:7]
                 e["address_id"]=addr_id(address)
                 e["random_address_kind"]={0:"NRPA",1:"RPA",3:"static"}.get(address[5] >> 6,"reserved")
@@ -152,6 +178,7 @@ class Reader:
             if op in ADV_COMMANDS:
                 e=dict(base,event="CommandComplete",opcode=hx(op),status=b[3])
                 if op == 0x2036 and len(b) >= 5: e["selected_tx_dbm"]=struct.unpack("b",b[4:5])[0]
+                if op == 0xFD54 and len(b) >= 5: e["subcommand"]=b[4]
                 self.advertising.append(e)
         elif event == 0x0F and len(b) >= 4:
             op = u16(b[2:4])
@@ -191,11 +218,14 @@ class Reader:
         self.att_counts[counter_key][name] += 1
         # A request RX or response TX addresses the phone's own attribute server.
         requests={2,4,6,8,10,12,16,18,22,24,0x52}
-        server_local = incoming if op in requests else not incoming
+        # Confirmation is sent by the indication recipient (the GATT client).
+        server_local = incoming if op in requests or op == 30 else not incoming
         db_key="local" if server_local else f"remote/{handle}"
         db=self.db[db_key]
         e=dict(base,handle=hx(handle),direction="remote_to_phone" if incoming else "phone_to_remote",op=name,server="phone" if server_local else "remote",**c)
-        if op in (4,6,8,16) and len(p) >= 5:
+        if op in (2,3) and len(p) >= 3:
+            e["mtu"] = u16(p[1:3])
+        elif op in (4,6,8,16) and len(p) >= 5:
             e.update(start_handle=hx(u16(p[1:3])),end_handle=hx(u16(p[3:5])))
             if op in (6,8,16) and len(p) >= 7: e["attribute_type"]=uuid(p[5:]) if op != 6 else uuid(p[5:7])
             self.pending[(handle,incoming)]=(op,p)
@@ -217,8 +247,11 @@ class Reader:
             e["sensor_characteristics"]=entries
         elif op == 5 and len(p) >= 2:
             n=4 if p[1] == 1 else 18
+            cccds=[]
             for pos in range(2,len(p)-n+1,n):
                 value=p[pos:pos+n]; db["descriptors"][u16(value[:2])]=uuid(value[2:])
+                if uuid(value[2:]) == "0x2902": cccds.append(hx(u16(value[:2])))
+            if cccds: e["cccd_handles"]=cccds
         elif op in (10,12,18,0x52,27,29) and len(p) >= 3:
             h=u16(p[1:3]); char=db["chars"].get(h); desc=db["descriptors"].get(h)
             e["attribute_handle"]=hx(h)
@@ -232,6 +265,8 @@ class Reader:
                 e.update(measurement_flags=hx(u16(p[3:5])),power_watts=int.from_bytes(p[5:7],"little",signed=True))
             if op in (27,29) and char == "0x2a37" and len(p) >= 5:
                 e["heart_rate"]=u16(p[4:6]) if p[3] & 1 and len(p) >= 6 else p[4]
+            if op == 29 and char == "0x2a05" and len(p) == 7:
+                e.update(changed_start_handle=hx(u16(p[3:5])), changed_end_handle=hx(u16(p[5:7])))
             if op in (10,12): self.pending[(handle,incoming)]=(op,p)
         elif op == 1 and len(p) >= 5:
             e.update(request_opcode=f"0x{p[1]:02x}",attribute_handle=hx(u16(p[2:4])),att_error=f"0x{p[4]:02x}")

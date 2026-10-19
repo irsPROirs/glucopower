@@ -16,10 +16,6 @@ class BridgeProtocolTest {
         assertEquals(2, BridgeProtocol.watts(1.7, false))
         assertEquals(0, BridgeProtocol.watts(0.0, true))
     }
-    @Test fun cyclingPowerUsesFlagsAndSignedLittleEndianPower() {
-        assertArrayEquals(byteArrayOf(0, 0, 93, 0), BridgeProtocol.measurement(93))
-        assertArrayEquals(byteArrayOf(0, 0, 0x2c, 1), BridgeProtocol.measurement(300))
-    }
     @Test fun scanResponseNameRespectsUtf8ByteLimit() {
         assertTrue(BridgeProtocol.canIncludeName("GlucoPower"))
         assertTrue(BridgeProtocol.canIncludeName("x".repeat(25)))
@@ -35,7 +31,7 @@ class BridgeProtocolTest {
         assertFalse(BridgeProtocol.canIncludeName("", primary = true))
     }
     @Test fun heartDiagnosticDoesNotReplacePowerByDefault() {
-        assertEquals(0x1818, BridgeProtocol.serviceUuid(false))
+        assertEquals(0x1816, BridgeProtocol.serviceUuid(false))
         assertEquals(0x180d, BridgeProtocol.serviceUuid(true))
         assertArrayEquals(byteArrayOf(0, 93), BridgeProtocol.heartTestMeasurement())
     }
@@ -47,11 +43,11 @@ class BridgeProtocolTest {
     }
     @Test fun savedModeRestoresAndUnknownModeDefaultsToPower() {
         assertEquals(BridgeMode.HEART_GLUCOSE, BridgeMode.restore("HEART_GLUCOSE"))
-        assertEquals(BridgeMode.POWER_TEST, BridgeMode.restore("POWER_TEST"))
-        assertFalse(BridgeMode.POWER_TEST.heartProfile)
-        assertTrue(BridgeMode.POWER_TEST.test)
-        assertEquals(BridgeMode.POWER, BridgeMode.restore(null))
-        assertEquals(BridgeMode.POWER, BridgeMode.restore("unknown"))
+        assertEquals(BridgeMode.CADENCE_TEST, BridgeMode.restore("CADENCE_TEST"))
+        assertFalse(BridgeMode.CADENCE_TEST.heartProfile)
+        assertTrue(BridgeMode.CADENCE_TEST.test)
+        assertEquals(BridgeMode.CADENCE, BridgeMode.restore(null))
+        assertEquals(BridgeMode.CADENCE, BridgeMode.restore("unknown"))
     }
     @Test fun rejectsInvalidAndOutOfOrderMeasurements() {
         assertFalse(BridgeProtocol.accepts(Double.NaN, 1000, 0, 1000))

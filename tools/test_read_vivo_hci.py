@@ -156,6 +156,59 @@ class ReadVivoHciTests(unittest.TestCase):
             self.assertEqual((item["interval_ms"], item["latency"], item["timeout_ms"]), (30, 0, 2000))
             self.assertEqual(item["peer"], HCI.addr_id(SYNTHETIC_PEER))
 
+    def test_vendor_multi_advertiser_decodes_payloads_without_exporting_addresses(self):
+        # Android Multi_Advt 0xFD54: 24-byte parameter subcommand includes own address.
+        own = bytes.fromhex("102030405060")
+        parameters = (b"\x01" + le16(160) + le16(210) + bytes([0, 1]) + own
+                      + b"\x00" + SYNTHETIC_PEER + bytes([7, 0, 1, 0xF6]))
+        data = bytes.fromhex("02010203031818")
+        scan = bytes.fromhex("040941424303031818")
+        result = self.read([
+            (command(0xFD54, parameters), 0),
+            (command(0xFD54, bytes([2, len(data)]) + data.ljust(31, b"\0") + b"\x01"), 0),
+            (command(0xFD54, bytes([3, len(scan)]) + scan.ljust(31, b"\0") + b"\x01"), 0),
+            (command(0xFD54, b"\x04" + own + b"\x01"), 0),
+            (command(0xFD54, b"\x05\x01\x01"), 0),
+            (event(0x0E, b"\x01\x54\xfd\x00\x05"), 3),
+        ])
+        settings, data_event, scan_event, address, enabled, complete = result["advertising"]
+        self.assertEqual((settings["interval_min_ms"], settings["interval_max_ms"]), (100, 131.25))
+        self.assertEqual((settings["adv_type"], settings["own_address_type"], settings["primary_phy"]), (0, 1, 1))
+        self.assertTrue(settings["legacy_pdu"] and settings["connectable"] and settings["scannable"])
+        self.assertFalse(settings["directed"])
+        self.assertEqual((settings["channel_map"], settings["filter_policy"], settings["requested_tx_dbm"]), (7, 0, -10))
+        self.assertEqual(data_event["data"]["ad_types"], ["0x01", "0x03"])
+        self.assertEqual(data_event["data"]["flags"], "0x02")
+        self.assertEqual(data_event["data"]["service_uuids"], ["0x1818"])
+        self.assertEqual(scan_event["data"]["ad_types"], ["0x09", "0x03"])
+        self.assertEqual(scan_event["data"]["name_bytes"], 3)
+        self.assertEqual((address["random_address_kind"], address["address_id"]), ("RPA", HCI.addr_id(own)))
+        self.assertTrue(enabled["enabled"])
+        self.assertEqual((complete["status"], complete["subcommand"]), (0, 5))
+        self.assertTrue(all(item["advertising_handle"] == 1 for item in result["advertising"][:-1]))
+        self.assertNotIn(own.hex(), json.dumps(result))
+        self.assertNotIn(SYNTHETIC_PEER.hex(), json.dumps(result))
+        invalid = self.read([(command(0xFD54, b"\x01\x00"), 0)])
+        self.assertEqual(invalid["advertising"][0]["unsupported_parameter_length"], 2)
+
+    def test_service_changed_confirmation_belongs_to_local_server_and_mtu_is_decoded(self):
+        frames = [
+            (le_connection(0x40, 1), 3),
+            att(0x40, True, b"\x08\x01\x00\x09\x00\x03\x28"),
+            att(0x40, False, b"\x09\x07\x02\x00\x20\x03\x00\x05\x2a"),
+            att(0x40, True, b"\x02\xf4\x01"),
+            att(0x40, False, b"\x03\x05\x02"),
+            att(0x40, False, b"\x1d\x03\x00\x93\x00\x9f\x00"),
+            att(0x40, True, b"\x1e"),
+        ]
+        result = self.read(frames)
+        indication = next(item for item in result["att_events"] if item["op"] == "Indication")
+        self.assertEqual((indication["characteristic"], indication["changed_start_handle"], indication["changed_end_handle"]),
+                         ("0x2a05", "0x0093", "0x009f"))
+        confirmation = next(item for item in result["att_events"] if item["op"] == "Confirmation")
+        self.assertEqual((confirmation["server"], confirmation["direction"]), ("phone", "remote_to_phone"))
+        self.assertEqual([item["mtu"] for item in result["att_events"] if "mtu" in item], [500, 517])
+
     def test_incoming_client_discovers_phone_cccd_and_receives_test_notification(self):
         result = self.read([(le_connection(0x40, 1), 3)] + sensor_dialog(0x40, remote_client=True))
         events = result["att_events"]
