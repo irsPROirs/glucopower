@@ -36,7 +36,7 @@ class CadenceEncoderTest {
         encoder.sample(60, 0)
         assertEquals(1, u16(encoder.sample(120, 1000), 1))
         assertEquals(3, u16(encoder.sample(120, 2000), 1))
-        assertEquals(BridgeMode.CADENCE, BridgeMode.restore("POWER"))
-        assertEquals(BridgeMode.CADENCE_TEST, BridgeMode.restore("POWER_TEST"))
+        assertEquals(BridgeMode.POWER, BridgeMode.restore("POWER"))
+        assertEquals(BridgeMode.POWER_TEST, BridgeMode.restore("POWER_TEST"))
     }
 }

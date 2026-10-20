@@ -4,6 +4,7 @@ plugins {
 }
 
 android {
+    testOptions { unitTests.isIncludeAndroidResources = true }
     namespace = "com.example.glucoble"
     compileSdk = 36
     buildToolsVersion = "36.0.0"
@@ -12,8 +13,8 @@ android {
         applicationId = "com.example.glucoble"
         minSdk = 26
         targetSdk = 34
-        versionCode = 16
-        versionName = "1.15"
+        versionCode = 21
+        versionName = "1.20"
     }
 
     buildTypes {
@@ -36,6 +37,7 @@ kotlin {
 }
 
 dependencies {
+    implementation("com.google.android.material:material:1.14.0")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14.1")
     testImplementation("org.mockito:mockito-core:5.14.2")

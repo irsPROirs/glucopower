@@ -68,6 +68,26 @@ class BleDeliveryTest {
         callback = bridge.javaClass.getDeclaredMethod("createGattCallback", Int::class.javaPrimitiveType)
             .apply { isAccessible = true }.invoke(bridge, 1) as BluetoothGattServerCallback
     }
+    @Test fun powerServiceReadsRequiredValuesAndNotifies93AfterSubscription() {
+        field("mode", BridgeMode.POWER_TEST)
+        val service = invoke("createCyclingPowerService") as BluetoothGattService
+        assertEquals(GlucoBleBridgeService.SERVICE_CYCLING_POWER, service.uuid)
+        assertEquals(3, service.characteristics.size)
+        `when`(server.getService(service.uuid)).thenReturn(service)
+        measurement = service.getCharacteristic(GlucoBleBridgeService.CHAR_POWER_MEASUREMENT)
+        assertEquals(BluetoothGattCharacteristic.PROPERTY_NOTIFY, measurement.properties)
+        cccd = measurement.getDescriptor(GlucoBleBridgeService.CCCD_UUID)
+        callback.onCharacteristicReadRequest(device, 81, 0,
+            service.getCharacteristic(GlucoBleBridgeService.CHAR_POWER_FEATURE))
+        callback.onCharacteristicReadRequest(device, 82, 0,
+            service.getCharacteristic(GlucoBleBridgeService.CHAR_SENSOR_LOCATION))
+        drain()
+        verify(server).sendResponse(eq(device), eq(81), eq(0), eq(0), aryEq(byteArrayOf(0, 0, 0, 0)))
+        verify(server).sendResponse(eq(device), eq(82), eq(0), eq(0), aryEq(byteArrayOf(5)))
+        subscribe()
+        verify(server).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 0, 93, 0)))
+    }
+
     @After fun tearDown() { bridge.onDestroy(); drain() }
 
     @Test fun upgradeWithoutAdvertisingPreferenceUsesMinimalButKeepsExplicitChoice() {
@@ -578,7 +598,7 @@ class BleDeliveryTest {
             assertTrue(data.value.includeDeviceName)
             assertTrue(data.value.includeTxPowerLevel)
             assertEquals(listOf(ParcelUuid(if (mode == BridgeMode.CADENCE_TEST)
-                GlucoBleBridgeService.SERVICE_CYCLING_CADENCE else GlucoBleBridgeService.SERVICE_HEART_RATE)), data.value.serviceUuids)
+                GlucoBleBridgeService.SERVICE_CYCLING_CADENCE else if (mode == BridgeMode.POWER_TEST) GlucoBleBridgeService.SERVICE_CYCLING_POWER else GlucoBleBridgeService.SERVICE_HEART_RATE)), data.value.serviceUuids)
             assertEquals(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM, settings.value.txPowerLevel)
             assertTrue(settings.value.isConnectable)
         }

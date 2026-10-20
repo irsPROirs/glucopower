@@ -1,0 +1,25 @@
+<resources>
+    <style name="Theme.GlucoPower" parent="Theme.Material3Expressive.DayNight.NoActionBar">
+        <item name="colorPrimary">#0866A3</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorPrimaryContainer">#CBE9FF</item>
+        <item name="colorOnPrimaryContainer">#063653</item>
+        <item name="colorSecondary">#256888</item>
+        <item name="colorOnSecondary">#FFFFFF</item>
+        <item name="colorSecondaryContainer">#D4EDFF</item>
+        <item name="colorOnSecondaryContainer">#103C56</item>
+        <item name="colorTertiary">#087889</item>
+        <item name="colorSurface">#F3F9FF</item>
+        <item name="colorOnSurface">#132E42</item>
+        <item name="colorSurfaceVariant">#DCEAF5</item>
+        <item name="colorOnSurfaceVariant">#405D72</item>
+        <item name="colorOutline">#718FA6</item>
+        <item name="colorSurfaceContainer">#E8F3FC</item>
+        <item name="colorSurfaceContainerHigh">#DFEDF8</item>
+        <item name="android:statusBarColor">#F3F9FF</item>
+        <item name="android:navigationBarColor">#F3F9FF</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:fontFamily">sans</item>
+    </style>
+</resources>
