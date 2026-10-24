@@ -57,7 +57,6 @@ class BleDeliveryTest {
         `when`(device.address).thenReturn("02:00:00:00:00:01")
         `when`(device.bondState).thenReturn(BluetoothDevice.BOND_NONE)
         `when`(server.sendResponse(eq(device), anyInt(), anyInt(), anyInt(), nullable(ByteArray::class.java))).thenReturn(true)
-        field("vpmAdvertising", false)
         field("mode", BridgeMode.HEART_TEST)
         field("bleGeneration", 1)
         field("gattServer", server)
@@ -68,41 +67,44 @@ class BleDeliveryTest {
         callback = bridge.javaClass.getDeclaredMethod("createGattCallback", Int::class.javaPrimitiveType)
             .apply { isAccessible = true }.invoke(bridge, 1) as BluetoothGattServerCallback
     }
-    @Test fun powerServiceReadsRequiredValuesAndNotifies93AfterSubscription() {
-        field("mode", BridgeMode.POWER_TEST)
-        val service = invoke("createCyclingPowerService") as BluetoothGattService
-        assertEquals(GlucoBleBridgeService.SERVICE_CYCLING_POWER, service.uuid)
-        assertEquals(3, service.characteristics.size)
-        `when`(server.getService(service.uuid)).thenReturn(service)
-        measurement = service.getCharacteristic(GlucoBleBridgeService.CHAR_POWER_MEASUREMENT)
-        assertEquals(BluetoothGattCharacteristic.PROPERTY_NOTIFY, measurement.properties)
-        cccd = measurement.getDescriptor(GlucoBleBridgeService.CCCD_UUID)
-        callback.onCharacteristicReadRequest(device, 81, 0,
-            service.getCharacteristic(GlucoBleBridgeService.CHAR_POWER_FEATURE))
-        callback.onCharacteristicReadRequest(device, 82, 0,
-            service.getCharacteristic(GlucoBleBridgeService.CHAR_SENSOR_LOCATION))
-        drain()
-        verify(server).sendResponse(eq(device), eq(81), eq(0), eq(0), aryEq(byteArrayOf(0, 0, 0, 0)))
-        verify(server).sendResponse(eq(device), eq(82), eq(0), eq(0), aryEq(byteArrayOf(5)))
-        subscribe()
-        verify(server).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 0, 93, 0)))
-    }
 
     @After fun tearDown() { bridge.onDestroy(); drain() }
 
-    @Test fun upgradeWithoutAdvertisingPreferenceUsesMinimalButKeepsExplicitChoice() {
-        val prefs = bridge.getSharedPreferences("bridge", 0)
-        prefs.edit().remove("minimal_advertising").commit()
-        invoke("restoreSettings")
-        assertTrue(report().contains("UUID только в ADV, имя только в scan response"))
-        prefs.edit().putBoolean("minimal_advertising", false).commit()
-        invoke("restoreSettings")
-        assertTrue(report().contains("UUID в ADV и scan response"))
+    @Test fun cadenceCanBeReadWithoutSubscribingAndHasCrankOnlyFeature() {
+        field("mode", BridgeMode.CADENCE_TEST)
+        val service = invoke("createCyclingCadenceService") as BluetoothGattService
+        val characteristic = service.getCharacteristic(GlucoBleBridgeService.CHAR_CSC_MEASUREMENT)
+        assertEquals(BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+            characteristic.properties)
+        assertEquals(BluetoothGattCharacteristic.PERMISSION_READ, characteristic.permissions)
+        assertArrayEquals(byteArrayOf(2, 0), service.getCharacteristic(GlucoBleBridgeService.CHAR_CSC_FEATURE).value)
+        callback.onCharacteristicReadRequest(device, 81, 0, characteristic)
+        drain()
+        verify(server).sendResponse(eq(device), eq(81), eq(0), eq(0), aryEq(byteArrayOf(2, 0, 0, 0, 0)))
+        assertTrue(report().contains("подписки: 0"))
+        verify(server, never()).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
     }
+
+    @Test fun upgradeRetiresPowerAndExperimentalSettingsWithoutLosingGlucose() {
+        val prefs = bridge.getSharedPreferences("bridge", 0)
+        prefs.edit().putString("mode", "POWER_TEST").putString("ui_profile", "POWER")
+            .putBoolean("multiply", false).putString("adv_variant", "UUID_ONLY")
+            .putBoolean("vpm_advertising", true).putBoolean("minimal_advertising", false)
+            .putBoolean("advertise_name_primary", true).putString("mmol", "8.4")
+            .putLong("timestamp", 1000L).putString("source", "xDrip+").commit()
+        invoke("restoreSettings")
+        assertEquals("CADENCE", prefs.getString("mode", null))
+        assertEquals("CADENCE", prefs.getString("ui_profile", null))
+        for (key in listOf("multiply", "adv_variant", "vpm_advertising", "minimal_advertising", "advertise_name_primary")) {
+            assertFalse(prefs.contains(key))
+        }
+        assertEquals("84 об/мин", invoke("outputText"))
+    }
+
 
     @Test fun redmiAndroid16HeartSequenceDeliversTwelveSamplesOnlyAfterCccd() {
         // HCI 20261019-021620-073: link, six model reads, CCCD 0100,
-        // then twelve 00 5D notifications. Replay app callbacks, not the radio.
+        // then twelve notifications. Replay callbacks with the new test value 55, not the radio.
         field("isBleRunning", true)
         callback.onConnectionStateChange(device, 0, BluetoothProfile.STATE_CONNECTED)
         val info = invoke("createDeviceInformationService") as BluetoothGattService
@@ -116,14 +118,14 @@ class BleDeliveryTest {
         repeat(12) { index ->
             callback.onNotificationSent(device, BluetoothGatt.GATT_SUCCESS)
             drain()
-            if (index < 11) invoke("broadcastPowerMeasurement")
+            if (index < 11) invoke("broadcastMeasurement")
         }
         verify(server, times(12)).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false),
-            aryEq(byteArrayOf(0, 93)))
+            aryEq(byteArrayOf(0, 55)))
         assertTrue(report().contains("завершил успешно: 12"))
         callback.onConnectionStateChange(device, 0, BluetoothProfile.STATE_DISCONNECTED)
         drain()
-        invoke("broadcastPowerMeasurement")
+        invoke("broadcastMeasurement")
         verify(server, times(12)).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
     }
 
@@ -141,7 +143,7 @@ class BleDeliveryTest {
         field("isBleRunning", true)
         callback.onConnectionStateChange(device, 0, BluetoothProfile.STATE_CONNECTED)
         drain()
-        invoke("broadcastPowerMeasurement")
+        invoke("broadcastMeasurement")
         assertTrue(report().contains("подписки: 0"))
         verify(server, never()).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
     }
@@ -175,7 +177,7 @@ class BleDeliveryTest {
         callback.onDescriptorReadRequest(device, 43, 0, cccd)
         drain()
         verify(server).sendResponse(eq(device), eq(43), eq(0), eq(0), aryEq(byteArrayOf(1, 0)))
-        verify(server, times(2)).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 93)))
+        verify(server, times(2)).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 55)))
         assertTrue(report().contains("CCCD RESTORE"))
     }
 
@@ -232,7 +234,7 @@ class BleDeliveryTest {
     @Test fun connectionAloneDoesNotCountAsSubscriptionOrSendData() {
         callback.onConnectionStateChange(device, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_CONNECTED)
         drain()
-        invoke("broadcastPowerMeasurement")
+        invoke("broadcastMeasurement")
         verify(server, never()).connect(any(), anyBoolean())
         verify(server, never()).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
         assertTrue(report().contains("Соединения: 1; подписки: 0"))
@@ -243,7 +245,7 @@ class BleDeliveryTest {
         subscribe()
         val order = inOrder(server)
         order.verify(server).sendResponse(device, 42, BluetoothGatt.GATT_SUCCESS, 0, null)
-        order.verify(server).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 93)))
+        order.verify(server).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 55)))
         assertTrue(report().contains("Android принял: 1; завершил успешно: 0"))
         callback.onNotificationSent(device, BluetoothGatt.GATT_SUCCESS)
         drain()
@@ -253,14 +255,14 @@ class BleDeliveryTest {
 
     @Test fun periodicSamplesWaitForAndroidCompletion() {
         subscribe()
-        repeat(3) { invoke("broadcastPowerMeasurement") }
+        repeat(3) { invoke("broadcastMeasurement") }
         verify(server, times(1)).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
         callback.onNotificationSent(device, BluetoothGatt.GATT_SUCCESS)
         drain()
         verify(server, times(2)).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
     }
 
-    @Test fun cyclingPowerSubscriptionSendsLatestGlucoseAsWatts() {
+    @Test fun cadenceSubscriptionSendsCrankEvents() {
         field("mode", BridgeMode.CADENCE)
         field("currentMmol", 8.4)
         field("lastReadingTime", 1000L)
@@ -271,7 +273,7 @@ class BleDeliveryTest {
         subscribe()
         verify(server).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(2, 0, 0, 0, 0)))
         field("currentMmol", 9.3)
-        invoke("broadcastPowerMeasurement")
+        invoke("broadcastMeasurement")
         callback.onNotificationSent(device, BluetoothGatt.GATT_SUCCESS)
         drain()
         verify(server, times(2)).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(2, 0, 0, 0, 0)))
@@ -286,7 +288,6 @@ class BleDeliveryTest {
 
     @Test fun liveHeartProfileWaitsForGlucoseThenTransmitsXdripUpdatesTimesTen() {
         field("mode", BridgeMode.HEART_GLUCOSE)
-        field("multiplyBy10", false) // Power setting must not change the HR glucose scale.
         subscribe()
         verify(server, never()).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
         val receiver = bridge.javaClass.getDeclaredField("glucoseReceiver")
@@ -296,7 +297,7 @@ class BleDeliveryTest {
                 .putExtra("com.eveningoutpost.dexdrip.Extras.BgEstimate", mmol * 18.0182)
                 .putExtra("com.eveningoutpost.dexdrip.Extras.Time", time))
             drain()
-            invoke("broadcastPowerMeasurement")
+            invoke("broadcastMeasurement")
         }
         val now = System.currentTimeMillis()
         reading(8.4, now - 1000)
@@ -324,7 +325,7 @@ class BleDeliveryTest {
         field("currentMmol", 8.4)
         field("lastReadingTime", System.currentTimeMillis())
         subscribe()
-        invoke("broadcastPowerMeasurement") // Queued 93 must not survive the mode change.
+        invoke("broadcastMeasurement") // Queued 55 must not survive the mode change.
         bridge.onStartCommand(android.content.Intent()
             .putExtra(GlucoBleBridgeService.EXTRA_MODE, BridgeMode.HEART_GLUCOSE.name), 0, 1)
         drain()
@@ -332,7 +333,7 @@ class BleDeliveryTest {
         assertTrue(report().contains("подписки: 1"))
         callback.onNotificationSent(device, BluetoothGatt.GATT_SUCCESS)
         drain()
-        verify(server, times(1)).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 93)))
+        verify(server, times(1)).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 55)))
         verify(server, times(1)).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(0, 84)))
         assertEquals("HEART_GLUCOSE", bridge.getSharedPreferences("bridge", android.content.Context.MODE_PRIVATE)
             .getString("mode", null))
@@ -357,7 +358,7 @@ class BleDeliveryTest {
         subscribe()
         assertTrue(report().contains("ошибок: 1"))
         assertTrue(report().contains("код ошибки 5"))
-        invoke("broadcastPowerMeasurement")
+        invoke("broadcastMeasurement")
         verify(server, times(2)).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
         assertTrue(report().contains("Android принял: 1"))
     }
@@ -375,7 +376,7 @@ class BleDeliveryTest {
         verify(server, times(1)).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
     }
 
-    @Test fun advertisingWaitsForBothServicesAndAdvertisesOnlyPowerUuid() {
+    @Test fun advertisingWaitsForBothServicesAndAdvertisesOnlyCadenceUuid() {
         field("mode", BridgeMode.CADENCE)
         field("isBleStarting", true)
         val advertiser = mock(android.bluetooth.le.BluetoothLeAdvertiser::class.java)
@@ -411,11 +412,11 @@ class BleDeliveryTest {
 
     @Test fun unsubscribeDropsQueuedMeasurement() {
         subscribe()
-        invoke("broadcastPowerMeasurement")
+        invoke("broadcastMeasurement")
         subscribe(byteArrayOf(0, 0))
         callback.onNotificationSent(device, BluetoothGatt.GATT_SUCCESS)
         drain()
-        invoke("broadcastPowerMeasurement")
+        invoke("broadcastMeasurement")
         verify(server, times(1)).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
     }
 
@@ -444,7 +445,7 @@ class BleDeliveryTest {
         receiver.onReceive(bridge, android.content.Intent("glucodata.Minute")
             .putExtra("mgdl", 168).putExtra("Time", now - 1000))
         drain()
-        assertEquals("ТЕСТ: 93 в поле ЧСС, не реальные данные", invoke("outputText"))
+        assertEquals("ТЕСТ: 55 в поле ЧСС, не реальные данные", invoke("outputText"))
         val value = bridge.javaClass.getDeclaredField("currentMmol").apply { isAccessible = true }.getDouble(bridge)
         assertEquals(8.4, value, 0.001)
     }
@@ -468,7 +469,7 @@ class BleDeliveryTest {
         receiver.onReceive(bridge, android.content.Intent("android.bluetooth.device.action.KEY_MISSING")
             .putExtra(BluetoothDevice.EXTRA_DEVICE, device))
         drain()
-        invoke("broadcastPowerMeasurement")
+        invoke("broadcastMeasurement")
         assertTrue(report().contains("ACL UP"))
         assertTrue(report().contains("KEY_MISSING"))
         assertTrue(report().contains("Соединения: 0; подписки: 0"))
@@ -549,13 +550,13 @@ class BleDeliveryTest {
             aryEq(byteArrayOf(2, 0)))
     }
 
-    @Test fun powerProfileDoesNotPublishHeartRateService() {
+    @Test fun cadenceProfileDoesNotPublishHeartRateService() {
         val service = invoke("createCyclingCadenceService") as BluetoothGattService
         assertEquals(GlucoBleBridgeService.SERVICE_CYCLING_CADENCE, service.uuid)
         assertNull(service.getCharacteristic(GlucoBleBridgeService.CHAR_HEART_MEASUREMENT))
     }
 
-    private fun advertisedPackets(name: String, primaryName: Boolean, minimal: Boolean = false): Pair<AdvertiseData, AdvertiseData> {
+    private fun advertisedPackets(name: String): Pair<AdvertiseData, AdvertiseData> {
         val manager = mock(BluetoothManager::class.java)
         val adapter = mock(BluetoothAdapter::class.java)
         val advertiser = mock(BluetoothLeAdvertiser::class.java)
@@ -564,9 +565,7 @@ class BleDeliveryTest {
         field("bluetoothManager", manager)
         field("advertiser", advertiser)
         field("mode", BridgeMode.CADENCE_TEST)
-        field("advertiseNamePrimary", primaryName)
-        field("minimalAdvertising", minimal)
-        invoke("advertisePowerService")
+        invoke("advertiseService")
         val primary = ArgumentCaptor.forClass(AdvertiseData::class.java)
         val scan = ArgumentCaptor.forClass(AdvertiseData::class.java)
         val settings = ArgumentCaptor.forClass(AdvertiseSettings::class.java)
@@ -574,87 +573,33 @@ class BleDeliveryTest {
         assertTrue(settings.value.isConnectable)
         assertEquals(0, settings.value.timeout)
         assertEquals(listOf(ParcelUuid(GlucoBleBridgeService.SERVICE_CYCLING_CADENCE)), primary.value.serviceUuids)
-        if (minimal) assertTrue(scan.value.serviceUuids.isNullOrEmpty())
-        else assertEquals(primary.value.serviceUuids, scan.value.serviceUuids)
+        assertTrue(scan.value.serviceUuids.isNullOrEmpty())
         return primary.value to scan.value
     }
 
-    @Test fun vpmUsesSinglePacketAndRejectsOversizeUtf8Name() {
-        val manager = mock(BluetoothManager::class.java)
-        val adapter = mock(BluetoothAdapter::class.java)
-        val advertiser = mock(BluetoothLeAdvertiser::class.java)
-        `when`(manager.adapter).thenReturn(adapter)
-        `when`(adapter.name).thenReturn("GlucoPower")
-        field("bluetoothManager", manager)
-        field("advertiser", advertiser)
-        field("vpmAdvertising", true)
-        val settings = ArgumentCaptor.forClass(AdvertiseSettings::class.java)
-        val data = ArgumentCaptor.forClass(AdvertiseData::class.java)
-        for (mode in listOf(BridgeMode.CADENCE_TEST, BridgeMode.HEART_TEST)) {
-            clearInvocations(advertiser)
-            field("mode", mode)
-            invoke("advertisePowerService")
-            verify(advertiser).startAdvertising(settings.capture(), data.capture(), any(AdvertiseCallback::class.java))
-            assertTrue(data.value.includeDeviceName)
-            assertTrue(data.value.includeTxPowerLevel)
-            assertEquals(listOf(ParcelUuid(if (mode == BridgeMode.CADENCE_TEST)
-                GlucoBleBridgeService.SERVICE_CYCLING_CADENCE else if (mode == BridgeMode.POWER_TEST) GlucoBleBridgeService.SERVICE_CYCLING_POWER else GlucoBleBridgeService.SERVICE_HEART_RATE)), data.value.serviceUuids)
-            assertEquals(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM, settings.value.txPowerLevel)
-            assertTrue(settings.value.isConnectable)
-        }
-        clearInvocations(advertiser)
-        `when`(adapter.name).thenReturn("Я".repeat(10)) // 20 UTF-8 bytes.
-        invoke("advertisePowerService")
-        verify(advertiser, never()).startAdvertising(any(), any(), any(AdvertiseCallback::class.java))
-        assertTrue(report().contains("19 байт"))
-    }
 
     @Test fun minimalAdvertisingUsesOnlyUuidInPrimaryAndAccepts29ByteScanName() {
-        val packets = advertisedPackets("x".repeat(29), true, minimal = true)
+        val packets = advertisedPackets("x".repeat(29))
         assertFalse(packets.first.includeDeviceName)
         assertTrue(packets.second.includeDeviceName)
         assertTrue(report().contains("UUID только в ADV"))
-        assertFalse(BridgeProtocol.canIncludeName("x".repeat(30), uuidInScanResponse = false))
+        assertFalse(BridgeProtocol.canIncludeName("x".repeat(30)))
     }
 
-    @Test fun cyclingPowerUuidAndShortNameCanShareConnectablePrimaryAdvertising() {
-        val packets = advertisedPackets("vivo X300 Ultra", true)
-        assertTrue(packets.first.includeDeviceName)
-        assertFalse(packets.second.includeDeviceName)
-        assertTrue(report().contains("имя в основном пакете"))
-    }
 
-    @Test fun previousScanResponseNameLayoutRemainsAvailable() {
-        val packets = advertisedPackets("vivo X300 Ultra", false)
-        assertFalse(packets.first.includeDeviceName)
-        assertTrue(packets.second.includeDeviceName)
-        assertTrue(report().contains("имя в scan response"))
-    }
 
     @Test fun longUtf8NameFallsBackToScanResponseInsteadOfOverflowingPrimaryAdvertising() {
-        val packets = advertisedPackets("Я".repeat(12), true) // 24 bytes, not 12.
+        val packets = advertisedPackets("Я".repeat(12)) // 24 bytes, not 12.
         assertFalse(packets.first.includeDeviceName)
         assertTrue(packets.second.includeDeviceName)
     }
 
-    @Test fun oversizedNameIsOmittedButPowerUuidRemainsAdvertised() {
-        val packets = advertisedPackets("Я".repeat(13), true)
+    @Test fun oversizedNameIsOmittedButCadenceUuidRemainsAdvertised() {
+        val packets = advertisedPackets("Я".repeat(15))
         assertFalse(packets.first.includeDeviceName)
         assertFalse(packets.second.includeDeviceName)
     }
 
-    @Test fun changingAdvertisingLayoutRestartsGattAndPersistsChoiceWithoutChangingTestMode() {
-        field("isBleRunning", true)
-        bridge.onStartCommand(android.content.Intent()
-            .putExtra(GlucoBleBridgeService.EXTRA_MODE, BridgeMode.HEART_TEST.name)
-            .putExtra(GlucoBleBridgeService.EXTRA_ADVERTISE_NAME_PRIMARY, false), 0, 1)
-        drain()
-        verify(server).close()
-        assertEquals("ТЕСТ: 93 в поле ЧСС, не реальные данные", invoke("outputText"))
-        assertFalse(bridge.getSharedPreferences("bridge", android.content.Context.MODE_PRIVATE)
-            .getBoolean("advertise_name_primary", true))
-        assertTrue(report().contains("Смена рекламы: имя в основном пакете=false"))
-    }
 
     @Test fun stoppingDoesNotCancelAnObservedButUnretainedConnection() {
         callback.onConnectionStateChange(device, BluetoothGatt.GATT_SUCCESS, BluetoothProfile.STATE_CONNECTED)
@@ -693,37 +638,35 @@ class BleDeliveryTest {
         verify(server, never()).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
     }
 
-    @Test fun powerTestSendsFixed93WithoutGlucoseOrScaleSetting() {
+    @Test fun cadenceTestSends65WithoutGlucose() {
         field("mode", BridgeMode.CADENCE_TEST)
-        field("multiplyBy10", false)
         val service = invoke("createCyclingCadenceService") as BluetoothGattService
         `when`(server.getService(service.uuid)).thenReturn(service)
         measurement = service.getCharacteristic(GlucoBleBridgeService.CHAR_CSC_MEASUREMENT)
         cccd = measurement.getDescriptor(GlucoBleBridgeService.CCCD_UUID)
         subscribe()
         verify(server).notifyCharacteristicChanged(eq(device), eq(measurement), eq(false), aryEq(byteArrayOf(2, 0, 0, 0, 0)))
-        assertEquals("ТЕСТ: 93 об/мин, не реальные данные", invoke("outputText"))
-        assertTrue(report().contains("тестовые 93; не зависят от входной глюкозы"))
+        assertEquals("ТЕСТ: 65 об/мин, не реальные данные", invoke("outputText"))
+        assertTrue(report().contains("тестовые 65; не зависят от входной глюкозы"))
     }
 
-    @Test fun powerTestRestoresInNewServiceWithoutOverwritingRealReading() {
+    @Test fun cadenceTestRestoresInNewServiceWithoutOverwritingRealReading() {
         field("mode", BridgeMode.CADENCE)
         field("isBleRunning", true)
         bridge.getSharedPreferences("bridge", android.content.Context.MODE_PRIVATE).edit()
             .putString("source", "GlucoDataHandler").putString("mmol", "6.2")
             .putLong("timestamp", 1000L).commit()
         invoke("restoreReading")
-        // The legacy test intent must migrate without inserting fake glucose.
+        // Test mode must persist without inserting fake glucose.
         bridge.onStartCommand(android.content.Intent()
-            .putExtra(GlucoBleBridgeService.EXTRA_MODE, BridgeMode.CADENCE.name)
-            .putExtra(GlucoBleBridgeService.EXTRA_TEST_MMOL, 9.3), 0, 1)
+            .putExtra(GlucoBleBridgeService.EXTRA_MODE, BridgeMode.CADENCE_TEST.name), 0, 1)
         drain()
         val restored = Robolectric.buildService(GlucoBleBridgeService::class.java).get()
         try {
             restored.javaClass.getDeclaredMethod("restoreSettings").apply { isAccessible = true }.invoke(restored)
             assertEquals(BridgeMode.CADENCE_TEST,
                 restored.javaClass.getDeclaredField("mode").apply { isAccessible = true }.get(restored))
-            assertEquals("ТЕСТ: 93 об/мин, не реальные данные",
+            assertEquals("ТЕСТ: 65 об/мин, не реальные данные",
                 restored.javaClass.getDeclaredMethod("outputText").apply { isAccessible = true }.invoke(restored))
             assertEquals(6.2, restored.javaClass.getDeclaredField("currentMmol").apply { isAccessible = true }.getDouble(restored), 0.001)
             assertEquals("6.2", bridge.getSharedPreferences("bridge", android.content.Context.MODE_PRIVATE).getString("mmol", null))
@@ -742,7 +685,7 @@ class BleDeliveryTest {
         verify(server, never()).notifyCharacteristicChanged(any(), any(), anyBoolean(), any(ByteArray::class.java))
     }
 
-    @Test fun switchingPowerTestToLiveKeepsConnectionAndDropsQueuedTest() {
+    @Test fun switchingCadenceTestToLiveKeepsConnectionAndDropsQueuedTest() {
         field("mode", BridgeMode.CADENCE_TEST)
         field("isBleRunning", true)
         field("currentMmol", 8.4)
@@ -752,7 +695,7 @@ class BleDeliveryTest {
         measurement = service.getCharacteristic(GlucoBleBridgeService.CHAR_CSC_MEASUREMENT)
         cccd = measurement.getDescriptor(GlucoBleBridgeService.CCCD_UUID)
         subscribe()
-        invoke("broadcastPowerMeasurement")
+        invoke("broadcastMeasurement")
         bridge.onStartCommand(android.content.Intent()
             .putExtra(GlucoBleBridgeService.EXTRA_MODE, BridgeMode.CADENCE.name), 0, 1)
         drain()

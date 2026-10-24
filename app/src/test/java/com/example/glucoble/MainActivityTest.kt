@@ -17,6 +17,21 @@ class MainActivityTest {
     private fun views(view: View): List<View> = listOf(view) +
         if (view is ViewGroup) (0 until view.childCount).flatMap { views(view.getChildAt(it)) } else emptyList()
 
+    @Test fun testMenuContainsOnlyCadence65AndHeart55() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        try {
+            val activity = controller.get()
+            activity.javaClass.getDeclaredMethod("showSettings").apply { isAccessible = true }.invoke(activity)
+            val dialog = org.robolectric.shadows.ShadowDialog.getLatestDialog()
+            val buttons = views(dialog.window!!.decorView).filterIsInstance<MaterialButton>()
+                .filter { it.id !in setOf(android.R.id.button1, android.R.id.button2, android.R.id.button3) }
+                .map { it.text.toString() }
+            assertEquals(setOf("Тест каденса · 65 об/мин", "Тест ЧСС · 55"), buttons.toSet())
+            assertFalse(views(dialog.window!!.decorView).any { it is com.google.android.material.materialswitch.MaterialSwitch })
+            dialog.dismiss()
+        } finally { controller.pause().stop().destroy() }
+    }
+
     @Test fun mainScreenHasOnlyRealProfilesAndStartStopActions() {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         try {
@@ -33,7 +48,7 @@ class MainActivityTest {
                 assertTrue("Button has no height", v.height > 0)
             }
             val buttons = all.filterIsInstance<MaterialButton>().map { it.text.toString() }
-            assertEquals(setOf("Каденс", "ЧСС", "Мощность", "Начать вещание", "Остановить"), buttons.toSet())
+            assertEquals(setOf("Каденс", "ЧСС", "Начать вещание", "Остановить"), buttons.toSet())
             assertFalse(all.filterIsInstance<TextView>().any { it.text.toString().contains("Тест каденса") })
             all.filterIsInstance<MaterialButton>().first { it.text == "ЧСС" }.performClick()
             assertEquals("HEART_GLUCOSE", activity.getSharedPreferences("bridge", 0).getString("ui_profile", null))

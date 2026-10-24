@@ -7,6 +7,19 @@ class CadenceEncoderTest {
     private fun u16(b: ByteArray, offset: Int) = (b[offset].toInt() and 255) or
         ((b[offset + 1].toInt() and 255) shl 8)
 
+    @Test fun sixtyFiveRpmStartsCorrectlyAfterLongDeviceUptime() {
+        val encoder = CadenceEncoder()
+        val start = 123456789L
+        val baseline = encoder.sample(65, start)
+        val first = encoder.sample(65, start + 1000)
+        assertEquals(0, u16(baseline, 3))
+        assertEquals(1, u16(first, 1))
+        assertEquals(65.0, 60.0 * 1024 / u16(first, 3), 0.1)
+        val later = encoder.sample(65, start + 60000)
+        assertEquals(65, u16(later, 1))
+        assertEquals(61440, u16(later, 3))
+    }
+
     @Test fun ninetyThreeRpmUsesCrankEventsAndRealElapsedTime() {
         val encoder = CadenceEncoder()
         assertArrayEquals(byteArrayOf(2, 0, 0, 0, 0), encoder.sample(93, 0))
@@ -36,7 +49,7 @@ class CadenceEncoderTest {
         encoder.sample(60, 0)
         assertEquals(1, u16(encoder.sample(120, 1000), 1))
         assertEquals(3, u16(encoder.sample(120, 2000), 1))
-        assertEquals(BridgeMode.POWER, BridgeMode.restore("POWER"))
-        assertEquals(BridgeMode.POWER_TEST, BridgeMode.restore("POWER_TEST"))
+        assertEquals(BridgeMode.CADENCE, BridgeMode.restore("POWER"))
+        assertEquals(BridgeMode.CADENCE, BridgeMode.restore("POWER_TEST"))
     }
 }
